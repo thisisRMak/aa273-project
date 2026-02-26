@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "goggles"
+version = "0.1.0"
+description = "Pre-decoder latent extraction from StreamVGGT for 3DGS coverage analysis"
+requires-python = ">=3.10"
+# Runtime deps are installed via Dockerfile; this is for editable install only
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["src"]
