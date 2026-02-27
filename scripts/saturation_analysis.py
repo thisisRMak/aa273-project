@@ -6,14 +6,14 @@ cross-frame representation converges as more views are added, and whether
 this convergence correlates with reconstruction metrics (PSNR, coverage)
 approaching their maxima.
 
-Four analyses:
-1. Camera token velocity — L2 norm of consecutive differences
-2. Global vs local velocity — split dims [0:1024] and [1024:2048]
-3. Cosine similarity ramp — consecutive token similarity
-4. Overlay with reconstruction metrics — dual-axis correlation plots
+Single-run mode:
+    python scripts/saturation_analysis.py path/to/run.h5
 
-Usage:
-    python notebooks/saturation_analysis.py [path_to_h5]
+Multi-run comparison mode:
+    python scripts/saturation_analysis.py path/to/run1.h5 path/to/run2.h5 [...]
+
+In multi-run mode, overlay plots are saved to a shared comparison/ directory
+alongside per-run analysis in each run's own directory.
 """
 
 import sys
@@ -46,6 +46,11 @@ def load_h5(path: str) -> dict:
             cg = f["converged"]
             data["converged"] = {
                 key: cg[key][:] for key in cg.keys()
+            }
+        if "secondary_metrics" in f:
+            sg = f["secondary_metrics"]
+            data["secondary_metrics"] = {
+                key: sg[key][:] for key in sg.keys()
             }
 
         data["streaming"] = f.attrs.get("streaming", False)
@@ -482,73 +487,351 @@ def plot_per_layer_velocity(tokens, scene_name, save_dir, layer_indices):
     plt.close(fig)
 
 
-# ── Main ────────────────────────────────────────────────────────────────
+# ── Per-run processing ─────────────────────────────────────────────────
 
-def main():
-    if len(sys.argv) > 1:
-        h5_path = sys.argv[1]
-    else:
-        # Default to latest streaming extraction
-        h5_path = str(
-            Path(__file__).resolve().parent.parent
-            / "data" / "flightroom_ssv_exp"
-            / "2026-02-20_051708_260views_full.h5"
-        )
+RUN_COLORS = ["steelblue", "crimson", "forestgreen", "darkorange", "purple", "teal"]
 
-    print(f"Loading: {h5_path}")
+
+def process_run(h5_path: str) -> dict:
+    """Load an h5 file and compute all per-run analysis data."""
     data = load_h5(h5_path)
-
     tokens = data["tokens"]
-    n_frames, n_layers, n_tokens, feat_dim = tokens.shape
-    print(f"Tokens: {n_frames} frames, {n_layers} layers, {n_tokens} tokens/frame, {feat_dim}-dim")
-    print(f"Streaming: {data['streaming']}")
+    n_frames = tokens.shape[0]
 
-    # Output directory
-    save_dir = Path(h5_path).parent / "saturation_analysis"
-    save_dir.mkdir(exist_ok=True)
-    print(f"Saving plots to: {save_dir}")
-
-    scene_name = data["scene_name"]
-
-    # Interpolate metrics to per-view
     metrics_per_view = None
     if "metrics" in data:
         metrics_per_view = interpolate_metrics_to_views(data["metrics"], n_frames)
-        if metrics_per_view:
-            print(f"Metrics interpolated to {n_frames} views")
-            for k, v in metrics_per_view.items():
-                print(f"  {k}: {v[0]:.3f} -> {v[-1]:.3f}")
 
-    # ── Analysis 1: Camera token velocity ───────────────────────────
-    print("\n── Analysis 1: Camera Token Velocity + Angular Distance ──")
+    secondary_metrics_per_view = None
+    if "secondary_metrics" in data:
+        secondary_metrics_per_view = interpolate_metrics_to_views(data["secondary_metrics"], n_frames)
+
     vel = camera_token_velocity(tokens, layer_idx=-1)
     ang_dist = camera_token_angular_distance(tokens, layer_idx=-1)
+    local_vel, global_vel = split_velocity(tokens, layer_idx=-1)
+    local_ang, global_ang = split_angular_distance(tokens, layer_idx=-1)
+    cos_sims = cosine_similarity_ramp(tokens, layer_idx=-1, offsets=(1, 5, 10))
+
+    return {
+        "h5_path": h5_path,
+        "label": data["scene_name"],
+        "data": data,
+        "tokens": tokens,
+        "metrics_per_view": metrics_per_view,
+        "secondary_metrics_per_view": secondary_metrics_per_view,
+        "vel": vel,
+        "ang_dist": ang_dist,
+        "local_vel": local_vel,
+        "global_vel": global_vel,
+        "local_ang": local_ang,
+        "global_ang": global_ang,
+        "cos_sims": cos_sims,
+    }
+
+
+# ── Comparison plots ───────────────────────────────────────────────────
+
+def plot_comparison_velocity(runs, save_dir):
+    """Overlay camera token angular distance across runs."""
+    fig, axes = plt.subplots(2, 1, figsize=(14, 10), sharex=True)
+
+    for i, run in enumerate(runs):
+        color = RUN_COLORS[i % len(RUN_COLORS)]
+        label = run["label"]
+
+        # Top: L2 velocity
+        frames = np.arange(1, len(run["vel"]) + 1)
+        axes[0].plot(frames, rolling_mean(run["vel"], SMOOTHING_WINDOW),
+                     color=color, linewidth=2, label=label)
+
+        # Bottom: angular distance
+        frames = np.arange(1, len(run["ang_dist"]) + 1)
+        axes[1].plot(frames, rolling_mean(run["ang_dist"], SMOOTHING_WINDOW),
+                     color=color, linewidth=2, label=label)
+
+    axes[0].set_ylabel("L2 velocity")
+    axes[0].set_title("Camera Token L2 Velocity — Comparison")
+    axes[0].grid(True, alpha=0.3)
+
+    axes[1].set_ylabel("Angular distance (1 - cos_sim)")
+    axes[1].set_xlabel("View index")
+    axes[1].set_title("Camera Token Angular Distance — Comparison")
+    axes[1].grid(True, alpha=0.3)
+
+    # Shared legend below plots
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center", ncol=len(runs),
+               fontsize=9, bbox_to_anchor=(0.5, -0.02))
+    fig.tight_layout(rect=[0, 0.05, 1, 1])
+    path = save_dir / "cmp_01_velocity.png"
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    print(f"Saved: {path}")
+    plt.close(fig)
+
+
+def plot_comparison_split(runs, save_dir):
+    """Overlay frame-local vs global angular distance across runs."""
+    fig, axes = plt.subplots(2, 1, figsize=(14, 10), sharex=True)
+
+    for i, run in enumerate(runs):
+        color = RUN_COLORS[i % len(RUN_COLORS)]
+        label = run["label"]
+        frames = np.arange(1, len(run["local_ang"]) + 1)
+
+        axes[0].plot(frames, rolling_mean(run["local_ang"], SMOOTHING_WINDOW),
+                     color=color, linewidth=2, label=label)
+        axes[1].plot(frames, rolling_mean(run["global_ang"], SMOOTHING_WINDOW),
+                     color=color, linewidth=2, label=label)
+
+    axes[0].set_ylabel("Angular distance (1 - cos_sim)")
+    axes[0].set_title("Frame-Local (dims 0:1024) Angular Distance — Comparison")
+    axes[0].grid(True, alpha=0.3)
+
+    axes[1].set_ylabel("Angular distance (1 - cos_sim)")
+    axes[1].set_xlabel("View index")
+    axes[1].set_title("Global-Temporal (dims 1024:2048) Angular Distance — Comparison")
+    axes[1].grid(True, alpha=0.3)
+
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center", ncol=len(runs),
+               fontsize=9, bbox_to_anchor=(0.5, -0.02))
+    fig.tight_layout(rect=[0, 0.05, 1, 1])
+    path = save_dir / "cmp_02_split_angular.png"
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    print(f"Saved: {path}")
+    plt.close(fig)
+
+
+def plot_comparison_cosine(runs, save_dir):
+    """Overlay cosine similarity ramp (k=1) across runs."""
+    fig, ax = plt.subplots(figsize=(14, 6))
+
+    for i, run in enumerate(runs):
+        color = RUN_COLORS[i % len(RUN_COLORS)]
+        label = run["label"]
+        if 1 in run["cos_sims"]:
+            sims = run["cos_sims"][1]
+            frames = np.arange(len(sims))
+            ax.plot(frames, rolling_mean(sims, SMOOTHING_WINDOW),
+                    color=color, linewidth=2, label=label)
+
+    ax.set_xlabel("View index")
+    ax.set_ylabel("Cosine similarity")
+    ax.set_title("Camera Token Cosine Similarity (k=1) — Comparison")
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim(-0.1, 1.1)
+
+    ax.legend(loc="lower center", bbox_to_anchor=(0.5, -0.15),
+              ncol=len(runs), fontsize=9)
+    fig.tight_layout(rect=[0, 0.06, 1, 1])
+    path = save_dir / "cmp_03_cosine_ramp.png"
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    print(f"Saved: {path}")
+    plt.close(fig)
+
+
+def plot_comparison_metrics(runs, save_dir):
+    """Overlay reconstruction metrics (PSNR, coverage) across runs."""
+    has_metrics = [r for r in runs if r["metrics_per_view"] is not None]
+    if not has_metrics:
+        print("  No metrics available for comparison")
+        return
+
+    fig, axes = plt.subplots(2, 1, figsize=(14, 10), sharex=True)
+
+    for i, run in enumerate(has_metrics):
+        color = RUN_COLORS[i % len(RUN_COLORS)]
+        label = run["label"]
+        mpv = run["metrics_per_view"]
+
+        if "psnr" in mpv:
+            axes[0].plot(np.arange(len(mpv["psnr"])), mpv["psnr"],
+                         color=color, linewidth=2, label=f"{label}")
+        if "coverage_mean" in mpv:
+            axes[1].plot(np.arange(len(mpv["coverage_mean"])), mpv["coverage_mean"],
+                         color=color, linewidth=2, label=f"{label}")
+
+        # Secondary eval metrics (dashed, lighter)
+        smpv = run.get("secondary_metrics_per_view")
+        if smpv:
+            if "psnr" in smpv:
+                axes[0].plot(np.arange(len(smpv["psnr"])), smpv["psnr"],
+                             color=color, linewidth=1.5, linestyle="--", alpha=0.6,
+                             label=f"{label} (full-scene eval)")
+            if "coverage_mean" in smpv:
+                axes[1].plot(np.arange(len(smpv["coverage_mean"])), smpv["coverage_mean"],
+                             color=color, linewidth=1.5, linestyle="--", alpha=0.6,
+                             label=f"{label} (full-scene eval)")
+
+    axes[0].set_ylabel("PSNR (dB)")
+    axes[0].set_title("PSNR — Comparison")
+    axes[0].grid(True, alpha=0.3)
+
+    axes[1].set_ylabel("Coverage")
+    axes[1].set_xlabel("View index")
+    axes[1].set_title("Coverage — Comparison")
+    axes[1].grid(True, alpha=0.3)
+
+    # Collect all unique handles/labels across both axes
+    all_handles, all_labels = [], []
+    for ax in axes:
+        h, l = ax.get_legend_handles_labels()
+        for hi, li in zip(h, l):
+            if li not in all_labels:
+                all_handles.append(hi)
+                all_labels.append(li)
+    fig.legend(all_handles, all_labels, loc="lower center",
+               ncol=min(len(all_labels), 3), fontsize=9,
+               bbox_to_anchor=(0.5, -0.04))
+    fig.tight_layout(rect=[0, 0.07, 1, 1])
+    path = save_dir / "cmp_04_metrics.png"
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    print(f"Saved: {path}")
+    plt.close(fig)
+
+
+def plot_comparison_combined(runs, save_dir):
+    """All runs on one plot: angular distance (left axis), PSNR + coverage (right axis).
+
+    Encoding:
+        color     = run identity
+        linestyle = metric type (solid=ang dist, dashed=PSNR, dotted=coverage)
+        markers   = full-scene (secondary) eval variant
+    """
+    from matplotlib.lines import Line2D
+
+    fig, ax1 = plt.subplots(figsize=(14, 8))
+    ax2 = ax1.twinx()
+
+    # Consistent linestyle per metric type (NOT per run)
+    METRIC_STYLES = {
+        "ang_dist":          dict(linestyle="-",  linewidth=2.5, alpha=1.0),
+        "psnr":              dict(linestyle="--", linewidth=1.8, alpha=0.7),
+        "coverage":          dict(linestyle=":",  linewidth=2.5, alpha=0.7),
+        "psnr_secondary":    dict(linestyle="--", linewidth=1.5, alpha=0.5, marker="s", markersize=3, markevery=10),
+        "coverage_secondary": dict(linestyle="--", linewidth=1.5, alpha=0.5, marker="^", markersize=4, markevery=10),
+    }
+
+    for i, run in enumerate(runs):
+        color = RUN_COLORS[i % len(RUN_COLORS)]
+
+        # Angular distance on left axis
+        frames = np.arange(1, len(run["ang_dist"]) + 1)
+        ax1.plot(frames, rolling_mean(run["ang_dist"], SMOOTHING_WINDOW),
+                 color=color, **METRIC_STYLES["ang_dist"])
+
+        # PSNR + coverage on right axis (primary eval)
+        mpv = run["metrics_per_view"]
+        if mpv and "psnr" in mpv:
+            ax2.plot(np.arange(len(mpv["psnr"])), mpv["psnr"],
+                     color=color, **METRIC_STYLES["psnr"])
+        if mpv and "coverage_mean" in mpv:
+            cov = mpv["coverage_mean"]
+            ax2.plot(np.arange(len(cov)), cov * 30 + 10,
+                     color=color, **METRIC_STYLES["coverage"])
+
+        # Secondary eval metrics
+        smpv = run.get("secondary_metrics_per_view")
+        if smpv and "psnr" in smpv:
+            ax2.plot(np.arange(len(smpv["psnr"])), smpv["psnr"],
+                     color=color, **METRIC_STYLES["psnr_secondary"])
+        if smpv and "coverage_mean" in smpv:
+            ax2.plot(np.arange(len(smpv["coverage_mean"])), smpv["coverage_mean"] * 30 + 10,
+                     color=color, **METRIC_STYLES["coverage_secondary"])
+
+    ax1.set_xlabel("View index")
+    ax1.set_ylabel("Angular distance (1 - cos_sim)", color="black")
+    ax2.set_ylabel("PSNR (dB) / Coverage (scaled)", color="gray")
+    ax2.tick_params(axis="y", labelcolor="gray")
+    ax1.set_title("Angular Distance vs Reconstruction Metrics — Comparison")
+    ax1.grid(True, alpha=0.3)
+
+    # --- Structured legend: color=run, linestyle=metric ---
+    # Row 1: run identity (colored solid lines)
+    run_handles = [Line2D([0], [0], color=RUN_COLORS[i % len(RUN_COLORS)],
+                          linewidth=2.5, linestyle="-")
+                   for i in range(len(runs))]
+    run_labels = [r["label"] for r in runs]
+
+    # Row 2: metric type (black lines with different styles)
+    metric_handles = [
+        Line2D([0], [0], color="black", **METRIC_STYLES["ang_dist"]),
+        Line2D([0], [0], color="black", **METRIC_STYLES["psnr"]),
+        Line2D([0], [0], color="black", **METRIC_STYLES["coverage"]),
+    ]
+    metric_labels = ["Angular distance (left axis)", "PSNR", "Coverage (scaled)"]
+
+    # Add secondary entries only if any run has them
+    has_secondary = any(r.get("secondary_metrics_per_view") for r in runs)
+    if has_secondary:
+        metric_handles.append(
+            Line2D([0], [0], color="black", **METRIC_STYLES["psnr_secondary"]))
+        metric_labels.append("PSNR (full-scene eval)")
+        metric_handles.append(
+            Line2D([0], [0], color="black", **METRIC_STYLES["coverage_secondary"]))
+        metric_labels.append("Coverage (full-scene, scaled)")
+
+    # Place two legend boxes below the plot
+    leg1 = fig.legend(run_handles, run_labels, loc="lower left",
+                      ncol=len(runs), fontsize=9,
+                      bbox_to_anchor=(0.05, -0.06),
+                      title="Condition", title_fontsize=9,
+                      framealpha=0.9)
+    fig.legend(metric_handles, metric_labels, loc="lower right",
+               ncol=2, fontsize=9,
+               bbox_to_anchor=(0.95, -0.06),
+               title="Metric", title_fontsize=9,
+               framealpha=0.9)
+    fig.add_artist(leg1)  # keep first legend when second is added
+
+    fig.tight_layout(rect=[0, 0.10, 1, 1])
+    path = save_dir / "cmp_05_combined.png"
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    print(f"Saved: {path}")
+    plt.close(fig)
+
+
+# ── Single-run analysis (original behavior) ───────────────────────────
+
+def analyze_single_run(run, save_dir):
+    """Run all per-run analyses and plots (original behavior)."""
+    tokens = run["tokens"]
+    scene_name = run["label"]
+    metrics_per_view = run["metrics_per_view"]
+
+    n_frames, n_layers, n_tokens, feat_dim = tokens.shape
+    print(f"Tokens: {n_frames} frames, {n_layers} layers, {n_tokens} tokens/frame, {feat_dim}-dim")
+    print(f"Streaming: {run['data']['streaming']}")
+
+    if metrics_per_view:
+        print(f"Metrics interpolated to {n_frames} views")
+        for k, v in metrics_per_view.items():
+            print(f"  {k}: {v[0]:.3f} -> {v[-1]:.3f}")
+
+    vel, ang_dist = run["vel"], run["ang_dist"]
+    local_vel, global_vel = run["local_vel"], run["global_vel"]
+    local_ang, global_ang = run["local_ang"], run["global_ang"]
+
+    print("\n── Analysis 1: Camera Token Velocity + Angular Distance ──")
     print(f"  L2 velocity — mean: {vel.mean():.3f}, first 10: {vel[:10].mean():.3f}, last 10: {vel[-10:].mean():.3f}")
     print(f"  Angular dist — mean: {ang_dist.mean():.4f}, first 10: {ang_dist[:10].mean():.4f}, last 10: {ang_dist[-10:].mean():.4f}")
     plot_camera_velocity(vel, ang_dist, metrics_per_view, scene_name, save_dir)
 
-    # ── Analysis 2: Frame-local vs global velocity ──────────────────
     print("\n── Analysis 2: Frame-Local vs Global (Velocity + Angular) ──")
-    local_vel, global_vel = split_velocity(tokens, layer_idx=-1)
-    local_ang, global_ang = split_angular_distance(tokens, layer_idx=-1)
     print(f"  Local  L2 — mean: {local_vel.mean():.3f}, first 10: {local_vel[:10].mean():.3f}, last 10: {local_vel[-10:].mean():.3f}")
     print(f"  Global L2 — mean: {global_vel.mean():.3f}, first 10: {global_vel[:10].mean():.3f}, last 10: {global_vel[-10:].mean():.3f}")
     print(f"  Local  ang — mean: {local_ang.mean():.4f}, first 10: {local_ang[:10].mean():.4f}, last 10: {local_ang[-10:].mean():.4f}")
     print(f"  Global ang — mean: {global_ang.mean():.4f}, first 10: {global_ang[:10].mean():.4f}, last 10: {global_ang[-10:].mean():.4f}")
     plot_split_velocity(local_vel, global_vel, local_ang, global_ang, scene_name, save_dir)
 
-    # ── Analysis 3: Cosine similarity ramp ──────────────────────────
     print("\n── Analysis 3: Cosine Similarity Ramp ──")
-    cos_sims = cosine_similarity_ramp(tokens, layer_idx=-1, offsets=(1, 5, 10))
-    for k, sims in sorted(cos_sims.items()):
+    for k, sims in sorted(run["cos_sims"].items()):
         print(f"  k={k}: mean={sims.mean():.4f}, first 10={sims[:10].mean():.4f}, last 10={sims[-10:].mean():.4f}")
-    plot_cosine_ramp(cos_sims, scene_name, save_dir)
+    plot_cosine_ramp(run["cos_sims"], scene_name, save_dir)
 
-    # ── Analysis 4: Metric overlay ──────────────────────────────────
     print("\n── Analysis 4: Metric Overlay ──")
     plot_metric_overlay(local_vel, global_vel, metrics_per_view, scene_name, save_dir)
 
-    # ── Analysis 5: Norm decomposition ─────────────────────────────
     print("\n── Analysis 5: Norm Decomposition ──")
     norms, cv = plot_norm_decomposition(tokens, -1, scene_name, save_dir)
     print(f"  Norm — mean: {norms.mean():.1f}, std: {norms.std():.1f}, CV: {cv:.3f}")
@@ -557,16 +840,14 @@ def main():
     else:
         print("  → Norms vary meaningfully — L2 velocity carries information beyond cosine similarity")
 
-    # ── Bonus: Per-layer velocity ───────────────────────────────────
     print("\n── Bonus: Per-Layer Velocity ──")
-    plot_per_layer_velocity(tokens, scene_name, save_dir, data["layer_indices"])
+    plot_per_layer_velocity(tokens, scene_name, save_dir, run["data"]["layer_indices"])
 
-    # ── Summary statistics ──────────────────────────────────────────
+    # Summary
     print("\n" + "=" * 60)
-    print("SATURATION SUMMARY")
+    print(f"SATURATION SUMMARY — {scene_name}")
     print("=" * 60)
 
-    # Compute velocity in thirds
     n = len(vel)
     third = n // 3
     v1, v2, v3 = vel[:third].mean(), vel[third:2*third].mean(), vel[2*third:].mean()
@@ -579,7 +860,6 @@ def main():
     else:
         print("  → Weak/no saturation signal (<25% velocity reduction)")
 
-    # Check if global half saturates more than local
     gl1 = global_vel[:third].mean()
     gl3 = global_vel[2*third:].mean()
     lo1 = local_vel[:third].mean()
@@ -592,7 +872,50 @@ def main():
     else:
         print("  → No clear differential saturation between halves")
 
-    print(f"\nAll plots saved to: {save_dir}")
+
+# ── Main ────────────────────────────────────────────────────────────────
+
+def main():
+    h5_paths = sys.argv[1:] if len(sys.argv) > 1 else [
+        str(Path(__file__).resolve().parent.parent
+            / "data" / "flightroom_ssv_exp"
+            / "2026-02-20_051708_260views_full.h5")
+    ]
+
+    # Load and process all runs
+    runs = []
+    for h5_path in h5_paths:
+        print(f"\nLoading: {h5_path}")
+        runs.append(process_run(h5_path))
+
+    # Per-run analysis (each gets its own output directory)
+    for run in runs:
+        save_dir = Path(run["h5_path"]).parent / "saturation_analysis"
+        save_dir.mkdir(exist_ok=True)
+        print(f"\n{'='*60}")
+        print(f"Per-run analysis: {run['label']}")
+        print(f"Saving to: {save_dir}")
+        print(f"{'='*60}")
+        analyze_single_run(run, save_dir)
+        print(f"\nAll plots saved to: {save_dir}")
+
+    # Comparison plots (only when multiple runs)
+    if len(runs) > 1:
+        cmp_name = "_vs_".join(r["label"] for r in runs)
+        cmp_dir = Path(h5_paths[0]).resolve().parent.parent / "comparison" / cmp_name
+        cmp_dir.mkdir(parents=True, exist_ok=True)
+        print(f"\n{'='*60}")
+        print(f"COMPARISON ({len(runs)} runs)")
+        print(f"Saving to: {cmp_dir}")
+        print(f"{'='*60}")
+
+        plot_comparison_velocity(runs, cmp_dir)
+        plot_comparison_split(runs, cmp_dir)
+        plot_comparison_cosine(runs, cmp_dir)
+        plot_comparison_metrics(runs, cmp_dir)
+        plot_comparison_combined(runs, cmp_dir)
+
+        print(f"\nComparison plots saved to: {cmp_dir}")
 
 
 if __name__ == "__main__":

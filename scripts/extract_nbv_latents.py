@@ -75,19 +75,33 @@ def parse_training_dir(training_dir: str) -> dict:
         config_text = f.read()
 
     # Extract data path from config (avoid full YAML load due to custom tags)
-    # The data field looks like: "data: &id003 !!python/object/apply:pathlib.PosixPath\n- flightroom_ssv_exp\n- transforms_sorted.json"
-    data_parts = []
+    # The data field can appear at top level or nested in the dataparser config.
+    # We collect ALL "data: PosixPath" occurrences and use the last one with
+    # actual path parts (the nested dataparser one takes precedence).
+    all_data_sections = []
+    current_parts = []
     in_data = False
     for line in config_text.split("\n"):
-        if line.startswith("data:") and "PosixPath" in line:
+        stripped = line.strip()
+        if stripped.startswith("data:") and "PosixPath" in stripped:
+            if in_data and current_parts:
+                all_data_sections.append(current_parts)
+            current_parts = []
             in_data = True
             continue
         if in_data:
-            stripped = line.strip()
             if stripped.startswith("- "):
-                data_parts.append(stripped[2:])
+                current_parts.append(stripped[2:])
             else:
-                break
+                if current_parts:
+                    all_data_sections.append(current_parts)
+                    current_parts = []
+                in_data = False
+    if in_data and current_parts:
+        all_data_sections.append(current_parts)
+
+    # Use the last section with path parts (dataparser-level overrides top-level)
+    data_parts = all_data_sections[-1] if all_data_sections else []
     if not data_parts:
         raise ValueError("Could not parse data path from config.yml")
 
@@ -147,6 +161,15 @@ def parse_training_dir(training_dir: str) -> dict:
     else:
         converged_metrics = []
 
+    # Also load secondary eval metrics if available
+    secondary_metrics_path = training_dir / "eval_all_images_secondary_metrics.json"
+    if secondary_metrics_path.exists():
+        with open(secondary_metrics_path) as f:
+            secondary_metrics = json.load(f)
+        logger.info("Loaded %d secondary eval metric entries", len(secondary_metrics))
+    else:
+        secondary_metrics = []
+
     scene_name = parts[outputs_idx + 1] if outputs_idx + 1 < len(parts) else "unknown"
     timestamp = training_dir.name
 
@@ -160,6 +183,7 @@ def parse_training_dir(training_dir: str) -> dict:
         "view_order": view_order,
         "metrics": metrics,
         "converged_metrics": converged_metrics,
+        "secondary_metrics": secondary_metrics,
     }
 
 
@@ -223,6 +247,13 @@ def save_nbv_latents(
         converged/lpips:      float   [n_converge_steps]
         converged/coverage_mean: float [n_converge_steps]
 
+        # Secondary eval metrics (from eval_all_images_secondary_metrics, optional)
+        secondary_metrics/step:       int     [n_secondary_steps]
+        secondary_metrics/psnr:       float   [n_secondary_steps]
+        secondary_metrics/ssim:       float   [n_secondary_steps]
+        secondary_metrics/lpips:      float   [n_secondary_steps]
+        secondary_metrics/coverage_mean: float [n_secondary_steps]
+
         # Metadata
         attrs: scene_name, timestamp, streaming, num_views_requested
     """
@@ -267,6 +298,14 @@ def save_nbv_latents(
                 values = [m[key] for m in cmetrics if key in m]
                 if values:
                     cg.create_dataset(key, data=values)
+
+        if parsed.get("secondary_metrics"):
+            sg = f.create_group("secondary_metrics")
+            smetrics = parsed["secondary_metrics"]
+            for key in ["step", "num_active_views", "psnr", "ssim", "lpips", "coverage_mean"]:
+                values = [m[key] for m in smetrics if key in m]
+                if values:
+                    sg.create_dataset(key, data=values)
 
         # Metadata
         f.attrs["scene_name"] = parsed["scene_name"]
