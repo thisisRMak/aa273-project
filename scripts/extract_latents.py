@@ -99,6 +99,14 @@ def main():
         help="Frames per batch in non-streaming mode (default: 16).",
     )
     parser.add_argument(
+        "--max-cache-frames",
+        type=int,
+        default=None,
+        help="Max past frames in KV cache for streaming mode. "
+             "Oldest frames evicted when exceeded. Default: None (unlimited). "
+             "Set smaller (e.g. 50) if GPU OOMs on long sequences.",
+    )
+    parser.add_argument(
         "--include-special-tokens",
         action="store_true",
         help="Include camera + register tokens (indices 0-4) in output.",
@@ -137,6 +145,7 @@ def main():
             image_paths,
             layer_indices=layer_indices,
             include_special_tokens=args.include_special_tokens,
+            max_cache_frames=args.max_cache_frames,
         )
     else:
         logger.info("Extracting in batch mode (chunk_size=%d)", args.chunk_size)
