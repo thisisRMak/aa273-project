@@ -99,6 +99,11 @@ python scripts/extract_latents.py /path/to/images/ -o latents.h5 --streaming  # 
 python scripts/extract_latents.py /path/to/images/ -o latents.h5 --all-layers  # all 24 layers (default: DPT taps [4,11,17,23])
 ```
 
+Note: If CUDA OOM errors occur:
+- For default and all-layers latent extraction: try reducing chunk sizes. The default is 16. Try `--chunk-size 8`, this worked on NVidia 3060 GPU.
+- For streaming latent extraction: try setting `--max-cache-frames 50`. Default is None. Setting this to 25 worked on NVidia 3060 GPU.
+
+
 ### Extract NBV-splat latents
 
 Extract latents aligned with nbv-splat training metrics (view-selection order + PSNR/SSIM/LPIPS/coverage):

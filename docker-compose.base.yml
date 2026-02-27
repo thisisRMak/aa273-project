@@ -1,0 +1,62 @@
+# GOGGLES base development environment (without coverage_view_selection)
+# Usage: docker compose -f docker-compose.base.yml up
+#
+# For the full environment with coverage_view_selection, use docker-compose.yml instead.
+#
+# Requires the figs:latest base image — build it first:
+#   cd ../FiGS-Standalone && docker compose build
+
+services:
+  goggles:
+    image: goggles:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      # Mount GOGGLES (this repo) for editable install
+      - .:/workspace/GOGGLES
+      # Mount FiGS-Standalone for editable install
+      - ${FIGS_PATH:-../FiGS-Standalone}:/workspace/FiGS-Standalone
+      # Mount StreamVGGT source (inference + model weights)
+      - ${SVGGT_PATH:-../StreamVGGT}:/workspace/StreamVGGT
+      # Mount data directory at same path as host so symlinks work
+      - ${DATA_PATH:-/media/admin/data/StanfordMSL}:${DATA_PATH:-/media/admin/data/StanfordMSL}
+    working_dir: /workspace/GOGGLES
+    environment:
+      - DISPLAY=${DISPLAY:-}
+      - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    network_mode: host
+    shm_size: '12gb'
+    stdin_open: true
+    tty: true
+    command: >
+      bash -c "
+        HOST_UID=$$(stat -c '%u' /workspace/GOGGLES)
+        HOST_GID=$$(stat -c '%g' /workspace/GOGGLES)
+        if ! getent passwd $$HOST_UID >/dev/null 2>&1; then
+          groupadd -g $$HOST_GID goggles 2>/dev/null || true
+          useradd -u $$HOST_UID -g $$HOST_GID -m -s /bin/bash goggles 2>/dev/null || true
+        fi
+        USERNAME=$$(getent passwd $$HOST_UID | cut -d: -f1)
+        # Fix any root-owned egg-info dirs from previous runs
+        find /workspace -maxdepth 3 -name '*.egg-info' -not -user $$HOST_UID -exec chown -R $$HOST_UID:$$HOST_GID {} + 2>/dev/null || true
+        # Install editable packages as host user so .egg-info is host-owned
+        runuser -u $$USERNAME -- python -m pip install -e /workspace/FiGS-Standalone --no-deps -q || { echo 'FATAL: failed to install figs'; exit 1; }
+        runuser -u $$USERNAME -- python -m pip install -e /workspace/FiGS-Standalone/gemsplat --no-deps -q || { echo 'FATAL: failed to install gemsplat'; exit 1; }
+        # Add StreamVGGT src to PYTHONPATH (no setup.py — raw source tree)
+        export PYTHONPATH=/workspace/StreamVGGT/src:\$$PYTHONPATH
+        echo 'export PYTHONPATH=/workspace/StreamVGGT/src:\$$PYTHONPATH' >> /home/$$USERNAME/.bashrc
+        runuser -u $$USERNAME -- python -m pip install -e /workspace/GOGGLES --no-deps -q || { echo 'FATAL: failed to install goggles'; exit 1; }
+        # Verify all packages are importable
+        runuser -u $$USERNAME -- python -c 'import figs, gemsplat, goggles; from streamvggt.models.streamvggt import StreamVGGT' || { echo 'FATAL: package import check failed'; exit 1; }
+        runuser -u $$USERNAME -- figs-info
+        echo '=== GOGGLES ready ==='
+        exec runuser -u $$USERNAME -- bash -l
+      "
