@@ -166,6 +166,97 @@ def predict_poses(model, images, device, dtype):
 
 
 # ---------------------------------------------------------------------------
+# Sliding window inference
+# ---------------------------------------------------------------------------
+
+def _trim_kv_cache(past_key_values, window_size):
+    """Trim KV cache to keep only the last window_size frames (dim=2).
+
+    KV tensors have shape (B, heads, num_frames, seq_per_frame, head_dim).
+    """
+    for i, kv in enumerate(past_key_values):
+        if kv is not None:
+            k, v = kv
+            if k.shape[2] > window_size:
+                past_key_values[i] = (
+                    k[:, :, -window_size:, :, :],
+                    v[:, :, -window_size:, :, :],
+                )
+
+
+@torch.no_grad()
+def predict_poses_windowed(model, images, device, dtype, window_size):
+    """StreamVGGT inference with sliding window KV-cache trimming.
+
+    Replicates model.inference() but trims both aggregator and camera_head
+    KV caches to the most recent `window_size` frames after each step.
+    Only computes camera poses (skips depth/point/track heads).
+
+    Args:
+        model: StreamVGGT model instance.
+        images: [N, 3, H, W] preprocessed image tensor.
+        device: torch device.
+        dtype: autocast dtype.
+        window_size: Number of frames to keep in the KV cache.
+
+    Returns:
+        pred_w2c: [N, 4, 4] w2c SE(3) tensor (float64).
+        pred_intrinsics: None (not computed in windowed mode).
+    """
+    from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+
+    N = images.shape[0]
+    past_key_values = [None] * model.aggregator.depth
+    past_key_values_camera = [None] * model.camera_head.trunk_depth
+
+    all_pose_enc = []
+    for i in range(N):
+        img = images[i : i + 1].unsqueeze(0).to(device)  # [1, 1, 3, H, W]
+
+        with torch.cuda.amp.autocast(dtype=dtype):
+            aggregator_output = model.aggregator(
+                img,
+                past_key_values=past_key_values,
+                use_cache=True,
+                past_frame_idx=i,
+            )
+            aggregated_tokens, patch_start_idx, past_key_values = aggregator_output
+
+            with torch.cuda.amp.autocast(enabled=False):
+                pose_enc, past_key_values_camera = model.camera_head(
+                    aggregated_tokens,
+                    past_key_values_camera=past_key_values_camera,
+                    use_cache=True,
+                )
+                pose_enc = pose_enc[-1]
+                camera_pose = pose_enc[:, 0, :]  # [1, 9]
+
+        all_pose_enc.append(camera_pose)
+
+        # Trim KV caches to sliding window
+        _trim_kv_cache(past_key_values, window_size)
+        _trim_kv_cache(past_key_values_camera, window_size)
+
+        if (i + 1) % 50 == 0 or i == N - 1:
+            logger.info("  Frame %d/%d", i + 1, N)
+
+    # Decode pose encodings to extrinsics
+    with torch.cuda.amp.autocast(dtype=torch.float64):
+        pose_enc = torch.stack(all_pose_enc, dim=1)  # [1, N, 9]
+        extrinsics, _ = pose_encoding_to_extri_intri(
+            pose_enc, images.shape[-2:]
+        )
+        pred_3x4 = extrinsics[0]  # [N, 3, 4]
+
+    bottom = torch.tensor(
+        [0, 0, 0, 1], dtype=torch.float64, device=device
+    ).expand(N, 1, 4)
+    pred_w2c = torch.cat([pred_3x4.double(), bottom], dim=1)
+
+    return pred_w2c, None
+
+
+# ---------------------------------------------------------------------------
 # Intrinsics comparison
 # ---------------------------------------------------------------------------
 
@@ -335,8 +426,18 @@ def main():
         help="Random seed (default: 42).",
     )
     parser.add_argument(
+        "--model",
+        choices=["streamvggt", "da3", "da3_chunked", "da3_pairwise"],
+        default="streamvggt",
+        help="Pose prediction model (default: streamvggt).",
+    )
+    parser.add_argument(
         "--checkpoint", default=None,
         help="Path to StreamVGGT checkpoint.",
+    )
+    parser.add_argument(
+        "--da3-model-name", default=None,
+        help="DA3 HuggingFace model ID (default: depth-anything/DA3-LARGE-1.1).",
     )
     parser.add_argument(
         "--device", default="cuda",
@@ -353,6 +454,35 @@ def main():
     parser.add_argument(
         "--compare-intrinsics", action="store_true",
         help="Also compare predicted vs GT focal lengths.",
+    )
+    parser.add_argument(
+        "--visualize", action="store_true",
+        help="Save 3D trajectory visualization on sparse point cloud.",
+    )
+    parser.add_argument(
+        "--sparse-pc", default=None,
+        help="Path to sparse_pc.ply (auto-discovered from transforms.json if omitted).",
+    )
+    parser.add_argument(
+        "--z-band", type=float, default=2.0,
+        help="Z-band half-width in meters for point cloud filtering (default: 2.0).",
+    )
+    parser.add_argument(
+        "--window-size", type=int, default=None,
+        help="Sliding window size for KV-cache trimming (StreamVGGT only). "
+        "Processes all frames with bounded memory. Default: None (unbounded).",
+    )
+    parser.add_argument(
+        "--chunk-size", type=int, default=60,
+        help="Chunk size for da3_chunked model (default: 60).",
+    )
+    parser.add_argument(
+        "--overlap", type=int, default=20,
+        help="Overlap between chunks for da3_chunked model (default: 20).",
+    )
+    parser.add_argument(
+        "--verbose", action="store_true",
+        help="Show per-frame diagnostic output.",
     )
 
     args = parser.parse_args()
@@ -424,52 +554,102 @@ def main():
     logger.info("GT poses loaded: %d frames", gt_w2c.shape[0])
 
     # ------------------------------------------------------------------
-    # Load model
+    # Load model and run inference
     # ------------------------------------------------------------------
-    from goggles.latent_extractor import LatentExtractor
+    if args.model == "streamvggt":
+        from goggles.latent_extractor import LatentExtractor
 
-    extractor = LatentExtractor(checkpoint_path=args.checkpoint, device=args.device)
-    model = extractor.model
-    device = extractor.device
-    dtype = extractor.dtype
+        extractor = LatentExtractor(checkpoint_path=args.checkpoint, device=args.device)
+        model = extractor.model
+        device = extractor.device
+        dtype = extractor.dtype
 
-    # ------------------------------------------------------------------
-    # Preprocess images
-    # ------------------------------------------------------------------
-    from streamvggt.utils.load_fn import load_and_preprocess_images
+        from streamvggt.utils.load_fn import load_and_preprocess_images
 
-    images = load_and_preprocess_images(image_paths)  # [N, 3, H, W]
-    logger.info("Preprocessed images: %s", list(images.shape))
+        images = load_and_preprocess_images(image_paths)  # [N, 3, H, W]
+        logger.info("Preprocessed images: %s", list(images.shape))
 
-    # ------------------------------------------------------------------
-    # Run inference
-    # ------------------------------------------------------------------
-    logger.info("Running StreamVGGT inference (%d frames)...", num_frames)
-    pred_w2c, pred_intrinsics = predict_poses(model, images, device, dtype)
+        preprocessed_hw = images.shape[-2:]
+
+        if args.window_size is not None:
+            logger.info(
+                "Running StreamVGGT sliding-window inference "
+                "(%d frames, window=%d)...",
+                num_frames, args.window_size,
+            )
+            pred_w2c, pred_intrinsics = predict_poses_windowed(
+                model, images, device, dtype, args.window_size,
+            )
+        else:
+            logger.info("Running StreamVGGT inference (%d frames)...", num_frames)
+            pred_w2c, pred_intrinsics = predict_poses(model, images, device, dtype)
+
+    elif args.model == "da3":
+        from goggles.da3_predictor import DA3PosePredictor
+
+        da3 = DA3PosePredictor(model_name=args.da3_model_name, device=args.device)
+        device = da3.device
+
+        # DA3 default processing resolution (upper_bound_resize to 504)
+        preprocessed_hw = (504, 504)
+
+        logger.info("Running DA3 inference (%d frames)...", num_frames)
+        pred_w2c, pred_intrinsics = da3.predict_poses(image_paths)
+
+    elif args.model == "da3_chunked":
+        from goggles.da3_chunked_predictor import DA3ChunkedPredictor
+
+        predictor = DA3ChunkedPredictor(
+            model_name=args.da3_model_name,
+            device=args.device,
+            chunk_size=args.chunk_size,
+            overlap=args.overlap,
+        )
+        device = predictor.device
+        preprocessed_hw = (504, 504)
+
+        logger.info(
+            "Running DA3 chunked inference (%d frames, chunk=%d, overlap=%d)...",
+            num_frames, args.chunk_size, args.overlap,
+        )
+        pred_w2c, pred_intrinsics = predictor.predict_poses(image_paths)
+
+    elif args.model == "da3_pairwise":
+        from goggles.da3_pairwise_predictor import DA3PairwisePredictor
+
+        predictor = DA3PairwisePredictor(
+            model_name=args.da3_model_name,
+            device=args.device,
+        )
+        device = predictor.device
+        preprocessed_hw = (504, 504)
+
+        logger.info("Running DA3 pairwise inference (%d frames)...", num_frames)
+        pred_w2c, pred_intrinsics = predictor.predict_poses(image_paths)
+
     logger.info("Predicted poses: %s", list(pred_w2c.shape))
 
     # ------------------------------------------------------------------
-    # Diagnostic: print poses for convention debugging
+    # Diagnostic: print poses for convention debugging (--verbose)
     # ------------------------------------------------------------------
-    diag_frames = [0, min(1, num_frames - 1), min(num_frames - 1, 19)]
-    diag_frames = sorted(set(diag_frames))
-    print("\n--- Diagnostic: pose samples ---")
-    for fi in diag_frames:
-        pred_np = pred_w2c[fi].cpu().numpy()
-        gt_np = gt_w2c[fi].numpy() if not gt_w2c.is_cuda else gt_w2c[fi].cpu().numpy()
-        # Translation magnitude
-        pred_t = np.linalg.norm(pred_np[:3, 3])
-        gt_t = np.linalg.norm(gt_np[:3, 3])
-        # Rotation angle from identity (how far from frame 0)
-        pred_r_trace = np.clip((np.trace(pred_np[:3, :3]) - 1) / 2, -1, 1)
-        gt_r_trace = np.clip((np.trace(gt_np[:3, :3]) - 1) / 2, -1, 1)
-        pred_angle = np.degrees(np.arccos(pred_r_trace))
-        gt_angle = np.degrees(np.arccos(gt_r_trace))
-        img_name = Path(image_paths[fi]).name
-        print(f"  Frame {fi} ({img_name}):")
-        print(f"    Pred w2c:  |t|={pred_t:.4f}  rot_from_I={pred_angle:.1f}deg")
-        print(f"    GT   w2c:  |t|={gt_t:.4f}  rot_from_I={gt_angle:.1f}deg")
-    print("---\n")
+    if args.verbose:
+        diag_frames = [0, min(1, num_frames - 1), min(num_frames - 1, 19)]
+        diag_frames = sorted(set(diag_frames))
+        print("\n--- Diagnostic: pose samples ---")
+        for fi in diag_frames:
+            pred_np = pred_w2c[fi].cpu().numpy()
+            gt_np = gt_w2c[fi].numpy() if not gt_w2c.is_cuda else gt_w2c[fi].cpu().numpy()
+            pred_t = np.linalg.norm(pred_np[:3, 3])
+            gt_t = np.linalg.norm(gt_np[:3, 3])
+            pred_r_trace = np.clip((np.trace(pred_np[:3, :3]) - 1) / 2, -1, 1)
+            gt_r_trace = np.clip((np.trace(gt_np[:3, :3]) - 1) / 2, -1, 1)
+            pred_angle = np.degrees(np.arccos(pred_r_trace))
+            gt_angle = np.degrees(np.arccos(gt_r_trace))
+            img_name = Path(image_paths[fi]).name
+            print(f"  Frame {fi} ({img_name}):")
+            print(f"    Pred w2c:  |t|={pred_t:.4f}  rot_from_I={pred_angle:.1f}deg")
+            print(f"    GT   w2c:  |t|={gt_t:.4f}  rot_from_I={gt_angle:.1f}deg")
+        print("---\n")
 
     # ------------------------------------------------------------------
     # Compute relative pose errors
@@ -485,6 +665,7 @@ def main():
     metrics = compute_pose_metrics(r_error_np, t_error_np)
     metrics["scene_name"] = scene_name
     metrics["num_frames"] = num_frames
+    metrics["model"] = args.model
 
     # ------------------------------------------------------------------
     # Optional intrinsics comparison
@@ -495,7 +676,7 @@ def main():
             pred_intrinsics,
             transforms["fl_x"], transforms["fl_y"],
             transforms["w"], transforms["h"],
-            images.shape[-2:],
+            preprocessed_hw,
         )
         metrics["intrinsics"] = intrinsic_metrics
 
@@ -522,6 +703,49 @@ def main():
         else:
             plot_path = f"eval_poses_{scene_name}.png"
         plot_error_distributions(r_error_np, t_error_np, metrics, plot_path)
+
+    # ------------------------------------------------------------------
+    # Trajectory visualization on point cloud
+    # ------------------------------------------------------------------
+    if args.visualize:
+        from goggles.visualization import (
+            align_poses_procrustes,
+            discover_sparse_pc,
+            load_sparse_pointcloud,
+            plot_trajectory_on_pointcloud,
+        )
+
+        # SE(3) Procrustes alignment: predicted -> GT world frame
+        aligned_c2w, _, gt_c2w = align_poses_procrustes(pred_w2c, gt_w2c)
+        gt_pos = gt_c2w[:, :3, 3].numpy()
+        pred_pos = aligned_c2w[:, :3, 3].numpy()
+
+        # Load sparse point cloud
+        pc_path = args.sparse_pc or discover_sparse_pc(transforms_path)
+        if pc_path is None:
+            logger.warning(
+                "No sparse_pc.ply found near %s. "
+                "Use --sparse-pc to specify the path. "
+                "Plotting trajectories without point cloud.",
+                transforms_path,
+            )
+            pcd_pts = np.empty((3, 0))
+            pcd_colors = None
+        else:
+            pcd_pts, pcd_colors = load_sparse_pointcloud(pc_path)
+
+        # Output path
+        if args.output:
+            vis_path = args.output.replace(".json", "_trajectory.png")
+        else:
+            vis_path = f"eval_poses_{scene_name}_trajectory.png"
+
+        plot_trajectory_on_pointcloud(
+            gt_pos, pred_pos, pcd_pts, pcd_colors,
+            title=f"{scene_name} ({num_frames} frames)",
+            output_path=vis_path,
+            z_band=args.z_band,
+        )
 
     return metrics
 

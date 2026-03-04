@@ -13,3 +13,10 @@ from goggles.pose_eval import (
     compute_pose_metrics,
     calculate_auc_np,
 )
+
+from goggles.visualization import (
+    align_poses_procrustes,
+    plot_trajectory_on_pointcloud,
+)
+
+from goggles.da3_predictor import DA3PosePredictor

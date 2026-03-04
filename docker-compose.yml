@@ -22,8 +22,13 @@ services:
       - ${CVS_PATH:-../coverage_view_selection}:/workspace/coverage_view_selection
       # Mount StreamVGGT source (inference + model weights)
       - ${SVGGT_PATH:-../StreamVGGT}:/workspace/StreamVGGT
+      # Mount Depth-Anything-3 for editable install
+      - ${DA3_PATH:-../Depth-Anything-3}:/workspace/Depth-Anything-3
       # Mount data directory at same path as host so symlinks work
       - ${DATA_PATH:-/media/admin/data/StanfordMSL}:${DATA_PATH:-/media/admin/data/StanfordMSL}
+      # Persist model caches across container restarts
+      - ${MODEL_CACHE:-/media/admin/data/StanfordMSL/model_cache}:/home/goggles/.cache
+      - ${MODEL_CACHE:-/media/admin/data/StanfordMSL/model_cache}/torch_hub:/home/goggles/.torch_hub
     working_dir: /workspace/GOGGLES
     environment:
       - DISPLAY=${DISPLAY:-}
@@ -67,8 +72,9 @@ services:
         export PYTHONPATH=/workspace/StreamVGGT/src:\$$PYTHONPATH
         echo 'export PYTHONPATH=/workspace/StreamVGGT/src:\$$PYTHONPATH' >> /home/$$USERNAME/.bashrc
         runuser -u $$USERNAME -- python -m pip install -e /workspace/GOGGLES --no-deps -q || { echo 'FATAL: failed to install goggles'; exit 1; }
+        runuser -u $$USERNAME -- python -m pip install -e /workspace/Depth-Anything-3 --no-deps -q || { echo 'FATAL: failed to install depth-anything-3'; exit 1; }
         # Verify all packages are importable
-        runuser -u $$USERNAME -- python -c 'import figs, gemsplat, nbv_gym, goggles; from streamvggt.models.streamvggt import StreamVGGT' || { echo 'FATAL: package import check failed'; exit 1; }
+        runuser -u $$USERNAME -- python -c 'import figs, gemsplat, nbv_gym, goggles; from streamvggt.models.streamvggt import StreamVGGT; from depth_anything_3.api import DepthAnything3' || { echo 'FATAL: package import check failed'; exit 1; }
         runuser -u $$USERNAME -- figs-info
         echo '=== GOGGLES ready ==='
         exec runuser -u $$USERNAME -- bash -l
