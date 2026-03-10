@@ -22,6 +22,8 @@ services:
       - ${CVS_PATH:-../coverage_view_selection}:/workspace/coverage_view_selection
       # Mount StreamVGGT source (inference + model weights)
       - ${SVGGT_PATH:-../StreamVGGT}:/workspace/StreamVGGT
+      # Mount reloc3r source tree (no setup.py — added to PYTHONPATH at startup)
+      - ${RELOC3R_PATH:-../reloc3r}:/workspace/reloc3r
       # Mount Depth-Anything-3 for editable install
       - ${DA3_PATH:-../Depth-Anything-3}:/workspace/Depth-Anything-3
       # Mount data directory at same path as host so symlinks work
@@ -68,6 +70,8 @@ services:
         fi
         # Fix home dir ownership (volume mounts may create it as root)
         chown -R $$HOST_UID:$$HOST_GID /home/$$USERNAME 2>/dev/null || true
+        # Fix any root-owned dirs in home from previous runs (pip .local, etc.)
+        mkdir -p /home/$$USERNAME/.local
         # Fix any root-owned egg-info dirs from previous runs
         find /workspace -maxdepth 3 -name '*.egg-info' -not -user $$HOST_UID -exec chown -R $$HOST_UID:$$HOST_GID {} + 2>/dev/null || true
         # Install editable packages as host user so .egg-info is host-owned
@@ -83,13 +87,19 @@ services:
           echo 'No custom nerfstudio fork found, using stock nerfstudio from image'
         fi
         runuser -u $$USERNAME -- python -m pip install -e /workspace/coverage_view_selection --no-deps -q || { echo 'FATAL: failed to install coverage_view_selection'; exit 1; }
-        # Add StreamVGGT src to PYTHONPATH (no setup.py — raw source tree)
+        # Add raw source trees to PYTHONPATH (no setup.py — raw source tree)
         export PYTHONPATH=/workspace/StreamVGGT/src:\$$PYTHONPATH
+        export PYTHONPATH=/workspace/reloc3r:\$$PYTHONPATH
         echo 'export PYTHONPATH=/workspace/StreamVGGT/src:\$$PYTHONPATH' >> /home/$$USERNAME/.bashrc
+        echo 'export PYTHONPATH=/workspace/reloc3r:$PYTHONPATH' >> /home/$$USERNAME/.bashrc
+        echo 'export PATH=$HOME/.local/bin:$PATH' >> /home/$$USERNAME/.bashrc
         runuser -u $$USERNAME -- python -m pip install -e /workspace/GOGGLES --no-deps -q || { echo 'FATAL: failed to install goggles'; exit 1; }
         runuser -u $$USERNAME -- python -m pip install -e /workspace/Depth-Anything-3 --no-deps -q || { echo 'FATAL: failed to install depth-anything-3'; exit 1; }
         # Verify all packages are importable
-        runuser -u $$USERNAME -- python -c 'import figs, gemsplat, nbv_gym, goggles; from streamvggt.models.streamvggt import StreamVGGT; from depth_anything_3.api import DepthAnything3' || { echo 'FATAL: package import check failed'; exit 1; }
+        runuser -u $$USERNAME -- python -c 'import figs, gemsplat, nbv_gym, goggles' || { echo 'FATAL: figs/gemsplat/nbv_gym/goggles import failed'; exit 1; }
+        runuser -u $$USERNAME -- python -c 'from streamvggt.models.streamvggt import StreamVGGT' || { echo 'FATAL: streamvggt import failed'; exit 1; }
+        runuser -u $$USERNAME -- python -c 'from depth_anything_3.api import DepthAnything3' || { echo 'FATAL: depth_anything_3 import failed'; exit 1; }
+        runuser -u $$USERNAME -- python -c 'from reloc3r.reloc3r_relpose import setup_reloc3r_relpose_model' || { echo 'FATAL: reloc3r import failed'; exit 1; }
         runuser -u $$USERNAME -- figs-info
         echo '=== GOGGLES ready ==='
         exec runuser -u $$USERNAME -- bash -l

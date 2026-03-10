@@ -11,7 +11,11 @@ GOGGLES runs inside Docker and depends on sibling repositories that should live 
 ```
 StanfordMSL/
 ├── GOGGLES/                  # this repo
+├── Depth-Anything-3/         # github.com/ByteDance-Seed/Depth-Anything-3 (raw git clone)
 ├── StreamVGGT/               # github.com/wzzheng/StreamVGGT (raw git clone)
+├── reloc3r/                  # https://github.com/ffrivera0/reloc3r (git clone, build croco)
+├── open_vins/                # https://github.com/rpng/open_vins.git (raw git clone)
+├── ov_ws/                    # colcon workspace built from open_vins/ (created by build_open_vins.sh)
 ├── FiGS-Standalone/          # 3DGS integration (provides the base Docker image)
 └── coverage_view_selection/  # nbv-splat + custom nerfstudio fork
 ```
@@ -40,18 +44,53 @@ huggingface-cli download lch01/StreamVGGT checkpoints.pth --local-dir StreamVGGT
 GOGGLES extends the `figs:latest` Docker image. Build it first:
 
 ```bash
-cd /path/to/StanfordMSL/FiGS-Standalone
+cd /path/to/StanfordMSL
+git clone https://github.com/madang6/FiGS-Standalone.git
+cd FiGS-Standalone
 docker compose build
 ```
 
-### 4. Build the GOGGLES image
+### 4. Clone reloc3r
+
+GOGGLES uses reloc3r. Clone the repo:
+
+```bash
+cd /path/to/StanfordMSL
+git clone https://github.com/ffrivera0/reloc3r.git
+cd reloc3r
+git submodule update --init --recursive
+```
+
+### 5. Clone OpenVINS
+
+GOGGLES uses OpenVINS for visual-inertial odometry pose estimation:
+
+```bash
+cd /path/to/StanfordMSL
+git clone https://github.com/rpng/open_vins.git
+```
+
+#TODO: How is OpenVINS setup
+
+### 6. Clone Depth-Anything-3
+
+GOGGLES uses Depth-Anything-3 for pose estimation. Clone the repo:
+
+```bash
+cd /path/to/StanfordMSL
+git clone https://github.com/ByteDance-Seed/Depth-Anything-3.git
+```
+
+No checkpoint download is required — models are fetched automatically from HuggingFace on first use.
+
+### 7. Build the GOGGLES image
 
 ```bash
 cd /path/to/StanfordMSL/GOGGLES
 docker compose build
 ```
 
-This installs StreamVGGT-specific dependencies (huggingface_hub, transformers, h5py, etc.) on top of the FiGS base image.
+This installs all extra dependencies (huggingface_hub, transformers, h5py, typer, moviepy, evo, pillow_heif, plyfile, etc.) on top of the FiGS base image. Note that `xformers` and `e3nn` are intentionally omitted to avoid breaking the pinned torch 2.1.2 environment; DA3 falls back gracefully to pure-PyTorch equivalents.
 
 ## Usage
 
@@ -59,6 +98,11 @@ This installs StreamVGGT-specific dependencies (huggingface_hub, transformers, h
 
 ```bash
 docker compose run --rm goggles
+```
+
+If you don't have `coverage_view_selection`, use the base config:
+```bash
+docker compose -f docker-compose.base.yml run --rm goggles
 ```
 
 On startup the container automatically:
@@ -74,6 +118,8 @@ Override default sibling repo paths or GPU selection via environment variables:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SVGGT_PATH` | `../StreamVGGT` | Path to StreamVGGT repo on host |
+| `RELOC3R_PATH` | `../reloc3r` | Path to reloc3r repo on host |
+| `DA3_PATH` | `../Depth-Anything-3` | Path to Depth-Anything-3 repo on host |
 | `FIGS_PATH` | `../FiGS-Standalone` | Path to FiGS-Standalone repo on host |
 | `CVS_PATH` | `../coverage_view_selection` | Path to coverage_view_selection repo on host |
 | `DATA_PATH` | `/media/admin/data/StanfordMSL` | Data directory (mounted at same path in container) |
@@ -110,7 +156,9 @@ python scripts/extract_nbv_latents.py /path/to/outputs/scene/nbv-splat/timestamp
 
 ### Evaluate camera poses
 
-Benchmark StreamVGGT pose predictions against ground-truth poses from nerfstudio `transforms.json` (3DGS training data). Uses all-pairs relative pose errors — no coordinate frame alignment needed:
+Benchmark pose predictions against ground-truth poses from nerfstudio `transforms.json`.  Uses all-pairs relative pose errors — no coordinate frame alignment needed.
+
+Supported models: `streamvggt` (default), `da3`, `da3_chunked`, `da3_pairwise`, `reloc3r`, `open_vins`.
 
 ```bash
 # From a transforms.json directly (20 uniformly-spaced frames)
@@ -182,3 +230,40 @@ Container: /workspace/StreamVGGT/src/           (added to PYTHONPATH)
 ```
 
 This means edits to StreamVGGT source on the host are immediately reflected inside the container. Model weights at `StreamVGGT/ckpt/checkpoints.pth` are also accessible via the mount.
+
+## How Depth-Anything-3 is integrated
+
+Depth-Anything-3 is a proper Python package (`pyproject.toml`) and is installed in editable mode at container startup:
+
+```
+Host:      StanfordMSL/Depth-Anything-3/        (git clone, no build step needed)
+Container: /workspace/Depth-Anything-3/         (pip install -e, src layout)
+```
+
+The `depth_anything_3` package is importable as a regular Python import. Model weights are downloaded automatically from HuggingFace on first use and cached at `~/.cache/huggingface/`.
+
+Two dependencies from DA3's `requirements.txt` are intentionally omitted from the Dockerfile:
+
+| Package | Reason omitted |
+|---------|---------------|
+| `xformers` | Would replace the pinned torch 2.1.2+cu118, breaking FiGS/gsplat. DA3 falls back to plain-PyTorch SwiGLU. |
+| `e3nn` | Requires torch ≥ 2.2.0. Only used for Spherical Harmonic rotation; not needed for pose or depth extraction. |
+
+The `da3_streaming/` sub-pipeline (long-video streaming inference) has additional dependencies (`faiss-gpu`, `pypose`, `numba`, `pandas`) that are also not installed — add them to the Dockerfile if that pipeline is needed.
+
+
+## How reloc3r is integrated
+
+reloc3r is **not** pip-installed. It is a raw git clone that gets bind-mounted into the container and made importable via `PYTHONPATH`:
+
+```
+Host:      StanfordMSL/reloc3r/                 (reloc3r/ package + croco/ submodule)
+Container: /workspace/reloc3r/                  (root added to PYTHONPATH)
+```
+
+Unlike StreamVGGT (which lives under a `src/` subdirectory), reloc3r's package directory sits at the repo root, so the repo root itself is added to `PYTHONPATH`. The `croco/` submodule must be initialised before building (`git submodule update --init --recursive`). Model weights are downloaded automatically from HuggingFace on first use.
+
+
+## How OpenVINS is integrated
+
+#TODO

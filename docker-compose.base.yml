@@ -19,10 +19,19 @@ services:
       - ${FIGS_PATH:-../FiGS-Standalone}:/workspace/FiGS-Standalone
       # Mount StreamVGGT source (inference + model weights)
       - ${SVGGT_PATH:-../StreamVGGT}:/workspace/StreamVGGT
+      # Mount reloc3r source tree (no setup.py — added to PYTHONPATH at startup)
+      - ${RELOC3R_PATH:-../reloc3r}:/workspace/reloc3r
       # Mount Depth-Anything-3 for editable install
       - ${DA3_PATH:-../Depth-Anything-3}:/workspace/Depth-Anything-3
       # Mount data directory at same path as host so symlinks work
       - ${DATA_PATH:-/media/admin/data/StanfordMSL}:${DATA_PATH:-/media/admin/data/StanfordMSL}
+      # Persist model caches across container restarts
+      - ${MODEL_CACHE:-/media/admin/data/StanfordMSL/model_cache}:/home/goggles/.cache
+      - ${MODEL_CACHE:-/media/admin/data/StanfordMSL/model_cache}/torch_hub:/home/goggles/.torch_hub
+      # Docker socket for cross-container orchestration (OpenVINS)
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Mount OpenVINS repo for config access + docker compose
+      - ${OPENVINS_PATH:-../open_vins}:/workspace/open_vins
     working_dir: /workspace/GOGGLES
     environment:
       - DISPLAY=${DISPLAY:-}
@@ -47,18 +56,36 @@ services:
           useradd -u $$HOST_UID -g $$HOST_GID -m -s /bin/bash goggles 2>/dev/null || true
         fi
         USERNAME=$$(getent passwd $$HOST_UID | cut -d: -f1)
+        # Grant Docker socket access (portable: detect host GID at runtime)
+        if [ -S /var/run/docker.sock ]; then
+          DOCKER_SOCK_GID=$$(stat -c '%g' /var/run/docker.sock)
+          if ! getent group $$DOCKER_SOCK_GID >/dev/null 2>&1; then
+            groupadd -g $$DOCKER_SOCK_GID docker-host 2>/dev/null || true
+          fi
+          DOCKER_GROUP=$$(getent group $$DOCKER_SOCK_GID | cut -d: -f1)
+          usermod -aG $$DOCKER_GROUP $$USERNAME 2>/dev/null || true
+        fi
+        # Fix home dir ownership (volume mounts may create it as root)
+        mkdir -p /home/$$USERNAME/.local
+        chown -R $$HOST_UID:$$HOST_GID /home/$$USERNAME 2>/dev/null || true
         # Fix any root-owned egg-info dirs from previous runs
         find /workspace -maxdepth 3 -name '*.egg-info' -not -user $$HOST_UID -exec chown -R $$HOST_UID:$$HOST_GID {} + 2>/dev/null || true
         # Install editable packages as host user so .egg-info is host-owned
         runuser -u $$USERNAME -- python -m pip install -e /workspace/FiGS-Standalone --no-deps -q || { echo 'FATAL: failed to install figs'; exit 1; }
         runuser -u $$USERNAME -- python -m pip install -e /workspace/FiGS-Standalone/gemsplat --no-deps -q || { echo 'FATAL: failed to install gemsplat'; exit 1; }
-        # Add StreamVGGT src to PYTHONPATH (no setup.py — raw source tree)
+        # Add raw source trees to PYTHONPATH (no setup.py — raw source tree)
         export PYTHONPATH=/workspace/StreamVGGT/src:\$$PYTHONPATH
+        export PYTHONPATH=/workspace/reloc3r:\$$PYTHONPATH
         echo 'export PYTHONPATH=/workspace/StreamVGGT/src:\$$PYTHONPATH' >> /home/$$USERNAME/.bashrc
+        echo 'export PYTHONPATH=/workspace/reloc3r:$PYTHONPATH' >> /home/$$USERNAME/.bashrc
+        echo 'export PATH=$HOME/.local/bin:$PATH' >> /home/$$USERNAME/.bashrc
         runuser -u $$USERNAME -- python -m pip install -e /workspace/GOGGLES --no-deps -q || { echo 'FATAL: failed to install goggles'; exit 1; }
         runuser -u $$USERNAME -- python -m pip install -e /workspace/Depth-Anything-3 --no-deps -q || { echo 'FATAL: failed to install depth-anything-3'; exit 1; }
         # Verify all packages are importable
-        runuser -u $$USERNAME -- python -c 'import figs, gemsplat, goggles; from streamvggt.models.streamvggt import StreamVGGT; from depth_anything_3.api import DepthAnything3' || { echo 'FATAL: package import check failed'; exit 1; }
+        runuser -u $$USERNAME -- python -c 'import figs, gemsplat, goggles' || { echo 'FATAL: figs/gemsplat/goggles import failed'; exit 1; }
+        runuser -u $$USERNAME -- python -c 'from streamvggt.models.streamvggt import StreamVGGT' || { echo 'FATAL: streamvggt import failed'; exit 1; }
+        runuser -u $$USERNAME -- python -c 'from depth_anything_3.api import DepthAnything3' || { echo 'FATAL: depth_anything_3 import failed'; exit 1; }
+        runuser -u $$USERNAME -- python -c 'from reloc3r.reloc3r_relpose import setup_reloc3r_relpose_model' || { echo 'FATAL: reloc3r import failed'; exit 1; }
         runuser -u $$USERNAME -- figs-info
         echo '=== GOGGLES ready ==='
         exec runuser -u $$USERNAME -- bash -l
