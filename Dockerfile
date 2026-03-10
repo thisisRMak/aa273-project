@@ -23,3 +23,7 @@ RUN python -m pip install --no-cache-dir \
 
 # Re-pin numpy after all installs (downstream packages may pull in numpy 2.x)
 RUN python -m pip install --no-cache-dir numpy==1.26.4
+
+# Docker CLI for cross-container orchestration (e.g., OpenVINS)
+# Only the CLI — no daemon. Socket is mounted at runtime.
+RUN apt-get update && apt-get install -y --no-install-recommends docker.io && rm -rf /var/lib/apt/lists/*

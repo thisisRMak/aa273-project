@@ -29,6 +29,10 @@ services:
       # Persist model caches across container restarts
       - ${MODEL_CACHE:-/media/admin/data/StanfordMSL/model_cache}:/home/goggles/.cache
       - ${MODEL_CACHE:-/media/admin/data/StanfordMSL/model_cache}/torch_hub:/home/goggles/.torch_hub
+      # Docker socket for cross-container orchestration (OpenVINS)
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Mount OpenVINS repo for config access + docker compose
+      - ${OPENVINS_PATH:-../open_vins}:/workspace/open_vins
     working_dir: /workspace/GOGGLES
     environment:
       - DISPLAY=${DISPLAY:-}
@@ -53,6 +57,17 @@ services:
           useradd -u $$HOST_UID -g $$HOST_GID -m -s /bin/bash goggles 2>/dev/null || true
         fi
         USERNAME=$$(getent passwd $$HOST_UID | cut -d: -f1)
+        # Grant Docker socket access (portable: detect host GID at runtime)
+        if [ -S /var/run/docker.sock ]; then
+          DOCKER_SOCK_GID=$$(stat -c '%g' /var/run/docker.sock)
+          if ! getent group $$DOCKER_SOCK_GID >/dev/null 2>&1; then
+            groupadd -g $$DOCKER_SOCK_GID docker-host 2>/dev/null || true
+          fi
+          DOCKER_GROUP=$$(getent group $$DOCKER_SOCK_GID | cut -d: -f1)
+          usermod -aG $$DOCKER_GROUP $$USERNAME 2>/dev/null || true
+        fi
+        # Fix home dir ownership (volume mounts may create it as root)
+        chown -R $$HOST_UID:$$HOST_GID /home/$$USERNAME 2>/dev/null || true
         # Fix any root-owned egg-info dirs from previous runs
         find /workspace -maxdepth 3 -name '*.egg-info' -not -user $$HOST_UID -exec chown -R $$HOST_UID:$$HOST_GID {} + 2>/dev/null || true
         # Install editable packages as host user so .egg-info is host-owned

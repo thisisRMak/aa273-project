@@ -1,0 +1,39 @@
+# Sweep configuration for automated pose estimation experiments.
+#
+# Usage:
+#   python scripts/run_sweep.py sweeps/example_sweep.yaml
+#   python scripts/run_sweep.py sweeps/example_sweep.yaml --dry-run
+#   python scripts/run_sweep.py sweeps/example_sweep.yaml --summary-only
+#
+# The runner computes the cross-product of all axes below and calls
+# eval_poses_experiment.py for each combination.  Simulation outputs are
+# reused across models/frame counts (only scene × course matters).
+
+# --- Sweep axes (cross-product) ------------------------------------------
+
+scenes:
+  - flightroom_ssv_exp/gemsplat/2026-02-27_025654
+  - button_drywall_on/splatfacto/2025-10-08_204137
+  - packardpark/gemsplat/2026-02-17_052524
+
+courses:
+  - circle_along_track
+  - square_along_track
+  # - s_curve_along_track_tilt15
+
+models:
+  - streamvggt
+  - da3_chunked
+
+# num_frames: [20, 50, 70]
+num_frames: [70]  
+
+# --- Optional defaults (override per-run CLI args) -----------------------
+
+# chunk_size: 60          # da3_chunked only
+# overlap: 20             # da3_chunked only
+# window_size: null       # streamvggt only
+# rollout: baseline
+# frame: carl
+# policy: vrmpc_rrt
+# experiments_dir: /media/admin/data/StanfordMSL/GOGGLES/experiments

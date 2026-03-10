@@ -233,9 +233,10 @@ def predict_poses_windowed(model, images, device, dtype, window_size):
 
         all_pose_enc.append(camera_pose)
 
-        # Trim KV caches to sliding window
+        # Trim aggregator KV cache to sliding window (this is the memory saver).
+        # Camera head cache is NOT trimmed — it's tiny (4 layers × 1 token/frame)
+        # but needs the full history to maintain a consistent pose coordinate frame.
         _trim_kv_cache(past_key_values, window_size)
-        _trim_kv_cache(past_key_values_camera, window_size)
 
         if (i + 1) % 50 == 0 or i == N - 1:
             logger.info("  Frame %d/%d", i + 1, N)
@@ -427,7 +428,7 @@ def main():
     )
     parser.add_argument(
         "--model",
-        choices=["streamvggt", "da3", "da3_chunked", "da3_pairwise"],
+        choices=["streamvggt", "da3", "da3_chunked", "da3_pairwise", "openvins"],
         default="streamvggt",
         help="Pose prediction model (default: streamvggt).",
     )
@@ -484,6 +485,10 @@ def main():
         "--verbose", action="store_true",
         help="Show per-frame diagnostic output.",
     )
+    parser.add_argument(
+        "--openvins-trajectory", default=None,
+        help="Path to TUM-format trajectory file (openvins model only).",
+    )
 
     args = parser.parse_args()
 
@@ -527,13 +532,25 @@ def main():
         transforms["frames"] = [transforms["frames"][i] for i in view_order]
 
     # ------------------------------------------------------------------
-    # Subsample frames (only in --transforms mode)
+    # Subsample frames (only in --transforms mode, batch models only)
     # ------------------------------------------------------------------
     total_frames = len(transforms["frames"])
+    _streaming_models = {"da3_pairwise", "openvins"}
+    _is_streaming = (
+        args.model in _streaming_models
+        or (args.model == "streamvggt" and args.window_size is not None)
+    )
+
     if args.num_frames and args.transforms:
-        indices = subsample_indices(total_frames, args.num_frames, args.subsample_method)
-        transforms["frames"] = [transforms["frames"][i] for i in indices]
-        image_paths = [image_paths[i] for i in indices]
+        if _is_streaming:
+            logger.info(
+                "Streaming model '%s': processing all %d frames (ignoring -n %d)",
+                args.model, total_frames, args.num_frames,
+            )
+        else:
+            indices = subsample_indices(total_frames, args.num_frames, args.subsample_method)
+            transforms["frames"] = [transforms["frames"][i] for i in indices]
+            image_paths = [image_paths[i] for i in indices]
 
     num_frames = len(transforms["frames"])
     num_pairs = num_frames * (num_frames - 1) // 2
@@ -626,6 +643,79 @@ def main():
 
         logger.info("Running DA3 pairwise inference (%d frames)...", num_frames)
         pred_w2c, pred_intrinsics = predictor.predict_poses(image_paths)
+
+    elif args.model == "openvins":
+        from goggles.tum_utils import load_tum_trajectory
+
+        if not args.openvins_trajectory:
+            logger.error("--openvins-trajectory required for openvins model")
+            sys.exit(1)
+
+        logger.info(
+            "Loading OpenVINS trajectory from %s", args.openvins_trajectory
+        )
+        all_pred_w2c, ov_timestamps = load_tum_trajectory(
+            args.openvins_trajectory, device=args.device
+        )
+
+        # OpenVINS produces poses only after initialization, so we may have
+        # fewer predicted poses than GT frames.  Match by timestamp using
+        # image_timestamps.csv (written by the experiment pipeline).
+        ov_dir = Path(args.openvins_trajectory).parent
+        image_ts_csv = ov_dir / "image_timestamps.csv"
+        if image_ts_csv.is_file():
+            gt_image_ts = []
+            with open(image_ts_csv) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    parts = line.split(",")
+                    gt_image_ts.append(float(parts[0]))
+            gt_image_ts = np.array(gt_image_ts)
+
+            # For each GT frame, find nearest OpenVINS pose (50 ms tolerance)
+            matched_pred = []
+            matched_gt_indices = []
+            tolerance = 0.05  # seconds
+            for gi, gt_t in enumerate(gt_image_ts):
+                diffs = np.abs(ov_timestamps - gt_t)
+                best = np.argmin(diffs)
+                if diffs[best] < tolerance:
+                    matched_pred.append(all_pred_w2c[best])
+                    matched_gt_indices.append(gi)
+
+            if len(matched_pred) == 0:
+                logger.error(
+                    "No OpenVINS poses matched GT timestamps "
+                    "(OV: %.3f–%.3f, GT: %.3f–%.3f)",
+                    ov_timestamps[0], ov_timestamps[-1],
+                    gt_image_ts[0], gt_image_ts[-1],
+                )
+                sys.exit(1)
+
+            pred_w2c = torch.stack(matched_pred)
+            # Subsample GT to matched frames only
+            transforms["frames"] = [transforms["frames"][i] for i in matched_gt_indices]
+            image_paths = [image_paths[i] for i in matched_gt_indices]
+            gt_w2c = extract_gt_poses_w2c(transforms)
+            num_frames = len(matched_gt_indices)
+            logger.info(
+                "Matched %d/%d OpenVINS poses to GT (%d total GT frames)",
+                len(matched_pred), len(ov_timestamps), len(gt_image_ts),
+            )
+        else:
+            # Fallback: assume 1:1 correspondence
+            pred_w2c = all_pred_w2c
+            logger.warning(
+                "No image_timestamps.csv — assuming 1:1 correspondence "
+                "(%d predicted, %d GT)", pred_w2c.shape[0], gt_w2c.shape[0],
+            )
+
+        pred_intrinsics = None
+        device = torch.device(args.device)
+        # OpenVINS doesn't preprocess images — use GT resolution
+        preprocessed_hw = None
 
     logger.info("Predicted poses: %s", list(pred_w2c.shape))
 

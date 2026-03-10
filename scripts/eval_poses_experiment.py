@@ -3,7 +3,13 @@
 
 Chains two stages:
   1. Simulate flight in GSplat scene → video + GT poses
-  2. Evaluate StreamVGGT pose predictions against GT
+  2. Evaluate pose predictions against GT
+
+Supported models: streamvggt, da3, da3_chunked, da3_pairwise, openvins.
+
+OpenVINS runs in a separate Docker container (openvins:rosfree) via the
+Docker socket. Before evaluation, it synthesizes IMU data from the saved
+tXUd trajectory and calls the OpenVINS binary to produce TUM-format poses.
 
 Usage:
     # Full pipeline
@@ -16,10 +22,17 @@ Usage:
         --scene flightroom_ssv_exp/gemsplat/2026-02-27_025654 \
         --course circle_toward_center \
         --skip-to evaluate --num-frames 50
+
+    # OpenVINS benchmark
+    python scripts/eval_poses_experiment.py \
+        --scene flightroom_ssv_exp/gemsplat/2026-02-27_025654 \
+        --course circle_toward_center \
+        --skip-to evaluate --model openvins
 """
 
 import argparse
 import logging
+import os
 import subprocess
 import sys
 from datetime import datetime
@@ -32,7 +45,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("experiment")
 
-DEFAULT_EXPERIMENTS_DIR = "/media/admin/data/StanfordMSL/GOGGLES/experiments"
+DEFAULT_EXPERIMENTS_DIR = "/workspace/GOGGLES/experiments"
 DEFAULT_NUM_FRAMES = 20
 
 STAGES = ["simulate", "evaluate"]
@@ -105,7 +118,7 @@ def main():
     # Pass-through pose model args
     parser.add_argument(
         "--model",
-        choices=["streamvggt", "da3", "da3_chunked", "da3_pairwise"],
+        choices=["streamvggt", "da3", "da3_chunked", "da3_pairwise", "openvins"],
         default="streamvggt",
         help="Pose prediction model (default: streamvggt).",
     )
@@ -121,6 +134,19 @@ def main():
     parser.add_argument(
         "--overlap", type=int, default=20,
         help="Overlap between chunks for da3_chunked model (default: 20).",
+    )
+    # OpenVINS-specific args
+    parser.add_argument(
+        "--openvins-config", default="/workspace/open_vins/config/flightroom",
+        help="OpenVINS config directory (default: flightroom).",
+    )
+    parser.add_argument(
+        "--imu-noise", default="euroc", choices=["euroc", "none"],
+        help="IMU noise preset for synthesis (default: euroc).",
+    )
+    parser.add_argument(
+        "--image-rate", type=float, default=None,
+        help="Camera frame rate in Hz for image timestamps (default: auto from tXUd).",
     )
     # Pass-through simulation args
     parser.add_argument("--rollout", default="baseline")
@@ -188,20 +214,125 @@ def main():
         sys.exit(1)
 
     # ------------------------------------------------------------------
+    # Stage 1.5: OPENVINS PREP (only for --model openvins)
+    # ------------------------------------------------------------------
+    openvins_tum_path = None
+    if args.model == "openvins" and skip_idx <= 1:
+        tXUd_path = exp_dir / "tXUd.npy"
+        if not tXUd_path.is_file():
+            logger.error("No tXUd.npy in %s. Re-run simulation (tXUd saving was added recently).", exp_dir)
+            sys.exit(1)
+
+        openvins_dir = exp_dir / "openvins"
+        openvins_dir.mkdir(exist_ok=True)
+        imu_csv = openvins_dir / "imu.csv"
+        image_ts_csv = openvins_dir / "image_timestamps.csv"
+        openvins_tum_path = openvins_dir / "poses_tum.txt"
+
+        # 1. Synthesize IMU from tXUd (runs in this container, Python only)
+        if not imu_csv.is_file() or args.force:
+            run_stage("IMU_SYNTHESIS", [
+                sys.executable, "-m", "figs.utilities.imu_synthesizer",
+                str(tXUd_path),
+                "-o", str(imu_csv),
+                "--noise", args.imu_noise,
+                "--seed", "42",
+            ])
+        else:
+            logger.info("IMU data exists, skipping synthesis (use --force to re-run)")
+
+        # 2. Generate image timestamps
+        if not image_ts_csv.is_file() or args.force:
+            import numpy as np
+            tXUd = np.load(tXUd_path)
+            num_images = len(list((exp_dir / "images").glob("*.png")))
+            duration = tXUd[0, -1] - tXUd[0, 0]
+            image_rate = args.image_rate or (num_images / duration if duration > 0 else 10.0)
+            start_time = tXUd[0, 0]
+
+            from figs.utilities.imu_synthesizer import generate_image_timestamps
+            generate_image_timestamps(
+                exp_dir / "images", image_ts_csv,
+                image_rate=image_rate, start_time=start_time,
+            )
+            logger.info("Generated image timestamps: %s (%.1f Hz, %d images)",
+                         image_ts_csv, image_rate, num_images)
+        else:
+            logger.info("Image timestamps exist, skipping (use --force to re-run)")
+
+        # 3. Run OpenVINS via Docker (cross-container call)
+        #    We use `docker run` with the pre-built openvins:rosfree image.
+        #    Path challenge: `-v` source paths must be HOST paths, but we're
+        #    inside the GOGGLES container. Solution: copy config into exp_dir
+        #    (on the shared data mount, same path in both containers) and
+        #    reference everything from there.
+        if not openvins_tum_path.is_file() or args.force:
+            import shutil
+
+            openvins_binary = "/opt/open_vins/ov_msckf/build/run_from_files"
+
+            # Copy OpenVINS config into experiment dir (shared mount)
+            config_dest = openvins_dir / "config"
+            if config_dest.exists():
+                shutil.rmtree(config_dest)
+            shutil.copytree(args.openvins_config, config_dest)
+            config_yaml = str(config_dest / "estimator_config.yaml")
+            logger.info("Copied OpenVINS config to %s", config_dest)
+
+            # The data dir is mounted at the same host path in both containers
+            data_root = os.environ.get("DATA_PATH", "/media/admin/data/StanfordMSL")
+
+            run_stage("OPENVINS", [
+                "docker", "run", "--rm",
+                "-v", f"{data_root}:{data_root}",
+                "openvins:rosfree",
+                openvins_binary,
+                config_yaml,
+                str(imu_csv),
+                str(exp_dir / "images"),
+                str(image_ts_csv),
+                str(openvins_tum_path),
+            ])
+        else:
+            logger.info("OpenVINS poses exist, skipping (use --force to re-run)")
+
+        if not openvins_tum_path.is_file():
+            logger.error("OpenVINS did not produce poses at %s", openvins_tum_path)
+            sys.exit(1)
+
+        # Check that poses were actually written (not just an empty/header-only file)
+        num_poses = sum(1 for line in open(openvins_tum_path)
+                        if line.strip() and not line.startswith("#"))
+        if num_poses == 0:
+            logger.error("OpenVINS wrote 0 poses — initialization likely failed. "
+                          "Check init_max_disparity in config.")
+            sys.exit(1)
+        logger.info("OpenVINS produced %d poses", num_poses)
+
+    # ------------------------------------------------------------------
     # Stage 2: EVALUATE
     # ------------------------------------------------------------------
-    # Include model + frame count in output files so runs coexist
-    metrics_stem = f"metrics_{args.model}_{args.num_frames}f"
+    # Streaming models process ALL frames; batch models use -n subsampling
+    is_streaming = (
+        args.model in ("da3_pairwise", "openvins")
+        or (args.model == "streamvggt" and args.window_size is not None)
+    )
+    if is_streaming:
+        metrics_stem = f"metrics_{args.model}_all"
+    else:
+        metrics_stem = f"metrics_{args.model}_{args.num_frames}f"
+
     if skip_idx <= 1:
         eval_cmd = [
             sys.executable, str(eval_script),
             "--transforms", str(exp_dir / "transforms.json"),
             "--model", args.model,
-            "-n", str(args.num_frames),
             "-o", str(exp_dir / f"{metrics_stem}.json"),
             "--plot",
             "--visualize",
         ]
+        if not is_streaming:
+            eval_cmd += ["-n", str(args.num_frames)]
         if args.da3_model_name:
             eval_cmd += ["--da3-model-name", args.da3_model_name]
         if args.window_size is not None:
@@ -209,6 +340,8 @@ def main():
         if args.model == "da3_chunked":
             eval_cmd += ["--chunk-size", str(args.chunk_size)]
             eval_cmd += ["--overlap", str(args.overlap)]
+        if args.model == "openvins" and openvins_tum_path:
+            eval_cmd += ["--openvins-trajectory", str(openvins_tum_path)]
 
         # Point cloud: prefer NED-frame sparse_pc_ned.ply (saved by simulate CLI)
         # over COLMAP-frame sparse_pc.ply (wrong coordinate system)
@@ -230,9 +363,13 @@ def main():
     logger.info("EXPERIMENT COMPLETE: %s", experiment_name)
     logger.info("=" * 60)
     logger.info("  Directory:   %s", exp_dir)
-    for name in ["video.mp4", "transforms.json", "sparse_pc_ned.ply",
-                  f"{metrics_stem}.json", f"{metrics_stem}.png",
-                  f"{metrics_stem}_trajectory.png"]:
+    output_files = ["video.mp4", "transforms.json", "tXUd.npy", "sparse_pc_ned.ply",
+                    f"{metrics_stem}.json", f"{metrics_stem}.png",
+                    f"{metrics_stem}_trajectory.png"]
+    if args.model == "openvins":
+        output_files += ["openvins/imu.csv", "openvins/image_timestamps.csv",
+                          "openvins/poses_tum.txt"]
+    for name in output_files:
         path = exp_dir / name
         status = "OK" if path.exists() else "missing"
         logger.info("  %-25s %s", name, status)
