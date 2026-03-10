@@ -819,20 +819,29 @@ def main():
         plot_error_distributions(r_error_np, t_error_np, metrics, plot_path)
 
     # ------------------------------------------------------------------
+    # Align predicted poses to GT (always, for .npz export)
+    # ------------------------------------------------------------------
+    from goggles.visualization import align_poses_first_frame
+
+    aligned_c2w, _, gt_c2w = align_poses_first_frame(pred_w2c, gt_w2c)
+    gt_pos = gt_c2w[:, :3, 3].numpy()
+    pred_pos = aligned_c2w[:, :3, 3].numpy()
+
+    # Save aligned positions for multi-method comparison plots
+    if args.output:
+        npz_path = args.output.replace(".json", "_trajectory.npz")
+        np.savez(npz_path, gt=gt_pos, pred=pred_pos)
+        logger.info("Saved aligned positions to %s", npz_path)
+
+    # ------------------------------------------------------------------
     # Trajectory visualization on point cloud
     # ------------------------------------------------------------------
     if args.visualize:
         from goggles.visualization import (
-            align_poses_procrustes,
             discover_sparse_pc,
             load_sparse_pointcloud,
             plot_trajectory_on_pointcloud,
         )
-
-        # SE(3) Procrustes alignment: predicted -> GT world frame
-        aligned_c2w, _, gt_c2w = align_poses_procrustes(pred_w2c, gt_w2c)
-        gt_pos = gt_c2w[:, :3, 3].numpy()
-        pred_pos = aligned_c2w[:, :3, 3].numpy()
 
         # Load sparse point cloud
         pc_path = args.sparse_pc or discover_sparse_pc(transforms_path)

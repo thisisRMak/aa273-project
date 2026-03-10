@@ -146,8 +146,8 @@ def main():
         help="OpenVINS config directory (default: flightroom).",
     )
     parser.add_argument(
-        "--imu-noise", default="euroc", choices=["euroc", "none"],
-        help="IMU noise preset for synthesis (default: euroc).",
+        "--imu-noise", default="none", choices=["euroc", "none"],
+        help="IMU noise preset for synthesis (default: none).",
     )
     parser.add_argument(
         "--image-rate", type=float, default=None,
@@ -284,7 +284,9 @@ def main():
             config_yaml = str(config_dest / "estimator_config.yaml")
             logger.info("Copied OpenVINS config to %s", config_dest)
 
-            # The data dir is mounted at the same host path in both containers
+            # The data dir is mounted at the same host path in both containers.
+            # Resolve symlinks so paths work in the OpenVINS container
+            # (which only has the data mount, not the GOGGLES workspace).
             data_root = os.environ.get("DATA_PATH", "/media/admin/data/StanfordMSL")
 
             run_stage("OPENVINS", [
@@ -292,11 +294,11 @@ def main():
                 "-v", f"{data_root}:{data_root}",
                 "openvins:rosfree",
                 openvins_binary,
-                config_yaml,
-                str(imu_csv),
-                str(exp_dir / "images"),
-                str(image_ts_csv),
-                str(openvins_tum_path),
+                str(Path(config_yaml).resolve()),
+                str(imu_csv.resolve()),
+                str((exp_dir / "images").resolve()),
+                str(image_ts_csv.resolve()),
+                str(openvins_tum_path.resolve()),
             ])
         else:
             logger.info("OpenVINS poses exist, skipping (use --force to re-run)")

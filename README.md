@@ -17,6 +17,8 @@ StanfordMSL/
 ├── open_vins/                # https://github.com/rpng/open_vins.git (raw git clone)
 ├── ov_ws/                    # colcon workspace built from open_vins/ (created by build_open_vins.sh)
 ├── FiGS-Standalone/          # 3DGS integration (provides the base Docker image)
+├── open_vins/                # OpenVINS ROS-free fork (VIO baseline)
+├── Depth-Anything-3/         # DA3 depth + pose estimation
 └── coverage_view_selection/  # nbv-splat + custom nerfstudio fork
 ```
 
@@ -205,20 +207,124 @@ python scripts/saturation_analysis.py /path/to/latents.h5
 GOGGLES/
 ├── src/goggles/
 │   ├── __init__.py
-│   ├── latent_extractor.py   # StreamVGGT wrapper for batch/streaming extraction
-│   └── pose_eval.py          # Relative pose error metrics (adapted from StreamVGGT eval)
+│   ├── latent_extractor.py        # StreamVGGT wrapper for batch/streaming extraction
+│   ├── pose_eval.py               # Relative pose error metrics (adapted from StreamVGGT eval)
+│   ├── da3_predictor.py           # DA3 batch pose predictor
+│   ├── da3_pairwise_predictor.py  # DA3 pairwise chaining with depth scale correction
+│   ├── da3_chunked_predictor.py   # DA3 chunked inference with SIM(3) alignment
+│   ├── imu_ekf.py                 # Error-state EKF fusing IMU + foundation model poses
+│   ├── tum_utils.py               # TUM trajectory I/O + camera-to-IMU extrinsic conversion
+│   ├── sim3_utils.py              # Umeyama SIM(3) alignment utilities
+│   └── visualization.py           # SE(3) Procrustes alignment + trajectory plotting
 ├── scripts/
-│   ├── extract_latents.py    # Extract aggregator tokens from images
-│   ├── extract_nbv_latents.py # Extract tokens aligned with nbv-splat metrics
-│   ├── eval_poses.py         # Benchmark pose predictions vs GT
-│   ├── linear_probe.py       # Ridge regression on camera tokens
-│   └── saturation_analysis.py # Feature convergence detection
-├── notes/                    # Analysis notes and results
-├── data/                     # Symlink to data storage (gitignored)
+│   ├── extract_latents.py         # Extract aggregator tokens from images
+│   ├── extract_nbv_latents.py     # Extract tokens aligned with nbv-splat metrics
+│   ├── eval_poses.py              # Benchmark pose predictions vs GT
+│   ├── eval_poses_experiment.py   # End-to-end: simulate → synthesize IMU → run models → evaluate
+│   ├── run_sweep.py               # Parameter sweep runner
+│   ├── linear_probe.py            # Ridge regression on camera tokens
+│   └── saturation_analysis.py     # Feature convergence detection
+├── notes/                         # Analysis notes and debugging records
+├── data/                          # Symlink to data storage (gitignored)
 ├── Dockerfile
 ├── docker-compose.yml
 └── pyproject.toml
 ```
+
+## OpenVINS integration
+
+GOGGLES can run [OpenVINS](https://docs.openvins.com/) as a visual-inertial odometry baseline. OpenVINS runs in a separate ROS-free Docker container and is invoked cross-container from the GOGGLES shell.
+
+### Setup
+
+1. **Build the OpenVINS container** (one-time):
+
+```bash
+cd /path/to/StanfordMSL/open_vins
+docker compose build
+```
+
+This builds `openvins:rosfree` — a minimal Ubuntu 22.04 image with Eigen3, Ceres, OpenCV, and the `run_from_files` binary (no ROS dependency). The Dockerfile is `open_vins/Dockerfile.rosfree`.
+
+2. **Verify the build**:
+
+```bash
+docker run --rm openvins:rosfree /opt/open_vins/ov_msckf/build/run_from_files --help
+```
+
+3. **GOGGLES container needs Docker socket access** (already configured in `docker-compose.yml`):
+
+```yaml
+volumes:
+  - /var/run/docker.sock:/var/run/docker.sock   # cross-container calls
+  - ${OPENVINS_PATH:-../open_vins}:/workspace/open_vins  # config access
+```
+
+The startup script auto-detects the Docker socket GID and grants the container user access.
+
+### Configuration
+
+OpenVINS config lives in `open_vins/config/flightroom/` (three files):
+
+| File | Purpose |
+|------|---------|
+| `estimator_config.yaml` | Filter settings, feature tracking, initialization |
+| `kalibr_imucam_chain.yaml` | Camera intrinsics + camera-to-IMU extrinsic (from carl.json) |
+| `kalibr_imu_chain.yaml` | IMU noise parameters (EuRoC ADIS16448 defaults) |
+
+**Key configuration choices:**
+
+- **Monocular**: `use_stereo: false`, `max_cameras: 1`
+- **Calibration fixed**: All `calib_*: false` — intrinsics and extrinsics are known from carl.json
+- **Dynamic initialization**: `init_imu_thresh: 0.0`, `init_max_disparity: 10.0` — forces dynamic init because the drone is always moving (see `notes/openvins_initialization_fix.md` for why this matters)
+- **Camera-to-IMU extrinsic**: Derived from carl.json's `camera_to_body_transform` (OpenGL cam → FRD body), converted through FRD→FLU and OpenGL→OpenCV
+
+### Pipeline
+
+When `eval_poses_experiment.py` runs with `--model openvins`:
+
+1. **IMU synthesis** (Python, runs in GOGGLES container):
+   - Reads `tXUd.npy` from the simulation stage
+   - `python -m figs.utilities.imu_synthesizer tXUd.npy -o imu.csv --noise euroc`
+   - Produces 200 Hz IMU CSV in FLU body frame: `timestamp, ax, ay, az, wx, wy, wz`
+
+2. **Image timestamps** (Python):
+   - Generates `image_timestamps.csv` mapping sequential PNG filenames to timestamps
+
+3. **OpenVINS execution** (Docker cross-container call):
+   ```bash
+   docker run --rm \
+     -v /media/admin/data/StanfordMSL:/media/admin/data/StanfordMSL \
+     openvins:rosfree \
+     /opt/open_vins/ov_msckf/build/run_from_files \
+       <config.yaml> <imu.csv> <images/> <timestamps.csv> <poses_tum.txt>
+   ```
+   Config is copied into the experiment directory (on the shared data mount) so paths work in both containers.
+
+4. **Output**: TUM-format trajectory (`timestamp tx ty tz qx qy qz qw`) — IMU body poses in world frame, converted to camera w2c via the camera-to-IMU extrinsic.
+
+### Standalone usage
+
+You can also run OpenVINS directly without the experiment pipeline:
+
+```bash
+# From host (or any shell with docker access)
+docker run --rm \
+  -v /media/admin/data/StanfordMSL:/media/admin/data/StanfordMSL \
+  openvins:rosfree \
+  /opt/open_vins/ov_msckf/build/run_from_files \
+    /media/admin/data/.../openvins/config/estimator_config.yaml \
+    /media/admin/data/.../openvins/imu.csv \
+    /media/admin/data/.../images/ \
+    /media/admin/data/.../openvins/image_timestamps.csv \
+    /media/admin/data/.../openvins/poses_tum.txt
+```
+
+### Validation
+
+The build was validated on the UZH-FPV drone racing dataset: 0.59m RMSE on a 124m trajectory (0.5% error). On synthetic FiGS data (after the initialization fix): 0.063m ATE RMSE, 1.17° median rotation error.
+
+See `notes/openvins_initialization_fix.md` for the full debugging story.
 
 ## How StreamVGGT is integrated
 

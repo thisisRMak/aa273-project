@@ -66,12 +66,19 @@ def load_sweep_config(path: str) -> dict:
 
 
 def experiment_dir_name(scene: str, course: str) -> str:
-    """Deterministic directory name for a (scene, course) pair.
-
-    Uses a fixed name (no timestamp) so simulation outputs are reused.
-    """
+    """Deterministic directory name for a (scene, course) pair."""
     scene_short = scene.split("/")[0]
     return f"{scene_short}_{course}"
+
+
+def sweep_dir_name(config_path: str) -> str:
+    """Create a timestamped sweep directory name from the config filename.
+
+    e.g. sweeps/example_sweep.yaml → example_sweep_2026-03-10_143000
+    """
+    stem = Path(config_path).stem
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    return f"{stem}_{timestamp}"
 
 
 def is_streaming_model(model: str, cfg: dict) -> bool:
@@ -235,7 +242,7 @@ def main():
     args = parser.parse_args()
 
     cfg = load_sweep_config(args.config)
-    experiments_dir = args.experiments_dir or cfg.get("experiments_dir", DEFAULT_EXPERIMENTS_DIR)
+    base_experiments_dir = args.experiments_dir or cfg.get("experiments_dir", DEFAULT_EXPERIMENTS_DIR)
 
     combos = list(itertools.product(
         cfg["scenes"], cfg["courses"], cfg["models"], cfg["num_frames"]
@@ -243,6 +250,12 @@ def main():
     logger.info("Sweep: %d scenes × %d courses × %d models × %d frame counts = %d runs",
                 len(cfg["scenes"]), len(cfg["courses"]), len(cfg["models"]),
                 len(cfg["num_frames"]), len(combos))
+
+    # Create a timestamped sweep directory so runs never overwrite each other
+    sweep_name = sweep_dir_name(args.config)
+    experiments_dir = str(Path(base_experiments_dir) / sweep_name)
+    Path(experiments_dir).mkdir(parents=True, exist_ok=True)
+    logger.info("Sweep directory: %s", experiments_dir)
 
     if args.summary_only:
         results = collect_existing_results(cfg, experiments_dir)
@@ -253,12 +266,12 @@ def main():
 
     # ---- Snapshot sweep config for reproducibility ----
     config_path = Path(args.config)
+    shutil.copy2(config_path, Path(experiments_dir) / "sweep_config.yaml")
     for scene, course in itertools.product(cfg["scenes"], cfg["courses"]):
         exp_dir = Path(experiments_dir) / experiment_dir_name(scene, course)
         exp_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(config_path, exp_dir / "sweep_config.yaml")
-    logger.info("Saved sweep_config.yaml to %d experiment directories",
-                len(cfg["scenes"]) * len(cfg["courses"]))
+    logger.info("Created %d experiment directories under %s",
+                len(cfg["scenes"]) * len(cfg["courses"]), sweep_name)
 
     # ---- Run the sweep ----
     results = []
@@ -301,7 +314,7 @@ def main():
         write_summary(results, summary_path)
 
         logger.info("Run analyze_sweep.py for detailed tables and figures:")
-        logger.info("  python scripts/analyze_sweep.py %s", args.config)
+        logger.info("  python scripts/analyze_sweep.py %s", experiments_dir)
 
 
 if __name__ == "__main__":

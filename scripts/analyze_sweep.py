@@ -15,12 +15,13 @@ Usage:
 """
 
 import argparse
+import glob
 import itertools
 import json
-import shutil
-from datetime import datetime
+import re
 from pathlib import Path
 
+import numpy as np
 import yaml
 
 
@@ -32,6 +33,21 @@ def experiment_dir_name(scene: str, course: str) -> str:
     return f"{scene_short}_{course}"
 
 
+def is_streaming_model(model: str, cfg: dict) -> bool:
+    """Check if a model runs in streaming mode (processes all frames)."""
+    return (
+        model in ("da3_pairwise", "openvins")
+        or (model == "streamvggt" and cfg.get("window_size") is not None)
+    )
+
+
+def metrics_filename(model: str, num_frames: int, cfg: dict) -> str:
+    """Return the metrics JSON filename for a model configuration."""
+    if is_streaming_model(model, cfg):
+        return f"metrics_{model}_all.json"
+    return f"metrics_{model}_{num_frames}f.json"
+
+
 def load_all_metrics(cfg: dict, experiments_dir: str) -> list[dict]:
     """Collect all metrics JSONs matching the sweep config."""
     results = []
@@ -39,7 +55,7 @@ def load_all_metrics(cfg: dict, experiments_dir: str) -> list[dict]:
         cfg["scenes"], cfg["courses"], cfg["models"], cfg["num_frames"]
     ):
         exp_name = experiment_dir_name(scene, course)
-        metrics_file = Path(experiments_dir) / exp_name / f"metrics_{model}_{n}f.json"
+        metrics_file = Path(experiments_dir) / exp_name / metrics_filename(model, n, cfg)
         if metrics_file.is_file():
             with open(metrics_file) as f:
                 m = json.load(f)
@@ -182,12 +198,12 @@ def _pivot_latex(rows_keys, models, lookup, metric_label, pick_best) -> str:
     return "\n".join(lines)
 
 
-def model_summary_table(results: list[dict], latex: bool = False) -> str:
-    """Aggregate table: one row per model, averaged across all scenes/courses."""
-    if not results:
-        return ""
+def _aggregate_summary(results: list[dict], group_key: str) -> tuple[list[str], list[tuple], dict]:
+    """Aggregate metrics by a grouping key (model, scene, or course).
 
-    models = sorted(set(r["model"] for r in results))
+    Returns (groups, metrics, agg) where agg maps group → {metric: avg_value}.
+    """
+    groups = sorted(set(r[group_key] for r in results))
     metrics = [
         ("rot_med", "Rot Med (°)"),
         ("rot_mean", "Rot Mean (°)"),
@@ -196,38 +212,75 @@ def model_summary_table(results: list[dict], latex: bool = False) -> str:
         ("auc5", "AUC@5"),
         ("auc15", "AUC@15"),
     ]
-
-    # Aggregate per model
     agg = {}
-    for model in models:
-        model_results = [r for r in results if r["model"] == model]
+    for g in groups:
+        group_results = [r for r in results if r[group_key] == g]
         row = {}
         for key, _ in metrics:
-            vals = [r[key] for r in model_results if r[key] is not None]
+            vals = [r[key] for r in group_results if r[key] is not None]
             row[key] = sum(vals) / len(vals) if vals else None
             row[f"{key}_n"] = len(vals)
-        agg[model] = row
+        agg[g] = row
+    return groups, metrics, agg
 
+
+def scene_summary_table(results: list[dict], latex: bool = False) -> str:
+    """Aggregate table: one row per scene, averaged across all courses/models."""
+    if not results:
+        return ""
+    groups, metrics, agg = _aggregate_summary(results, "scene")
+    title = "Scene Summary (averaged across courses/models)"
     if latex:
-        return _summary_latex(models, metrics, agg)
-    else:
-        return _summary_markdown(models, metrics, agg)
+        return _summary_latex(groups, metrics, agg, title=title, row_header="Scene")
+    return _summary_markdown(groups, metrics, agg, title=title, row_header="Scene")
 
 
-def _summary_markdown(models, metrics, agg) -> str:
+def course_summary_table(results: list[dict], latex: bool = False) -> str:
+    """Aggregate table: one row per course, averaged across all scenes/models."""
+    if not results:
+        return ""
+    groups, metrics, agg = _aggregate_summary(results, "course")
+    title = "Course Summary (averaged across scenes/models)"
+    if latex:
+        return _summary_latex(groups, metrics, agg, title=title, row_header="Course")
+    return _summary_markdown(groups, metrics, agg, title=title, row_header="Course")
+
+
+def model_summary_table(results: list[dict], latex: bool = False) -> str:
+    """Aggregate table: one row per model, averaged across all scenes/courses."""
+    if not results:
+        return ""
+    groups, metrics, agg = _aggregate_summary(results, "model")
+    title = "Model Summary (averaged across scenes/courses)"
+    if latex:
+        return _summary_latex(groups, metrics, agg, title=title, row_header="Model")
+    return _summary_markdown(groups, metrics, agg, title=title, row_header="Model")
+
+
+def _summary_markdown(groups, metrics, agg, title="Model Summary", row_header="Model") -> str:
     lines = []
-    lines.append("### Model Summary (averaged across scenes/courses)")
+    lines.append(f"### {title}")
     lines.append("")
 
+    # Find best value per metric column (lowest for errors, highest for AUC)
+    best_per_metric = {}
+    for key, _ in metrics:
+        vals = [agg[g][key] for g in groups if agg[g][key] is not None]
+        if vals:
+            best_per_metric[key] = max(vals) if key in HIGHER_IS_BETTER else min(vals)
+
     # Pre-compute all cells
-    headers = ["Model", "N"] + [label for _, label in metrics]
+    headers = [row_header, "N"] + [label for _, label in metrics]
     all_rows = []
-    for model in models:
-        row_data = agg[model]
+    for g in groups:
+        row_data = agg[g]
         n = row_data.get(f"{metrics[0][0]}_n", 0)
-        cells = [model, str(n)]
+        cells = [g, str(n)]
         for key, _ in metrics:
-            cells.append(fmt(row_data[key]))
+            v = row_data[key]
+            is_best = (v is not None and key in best_per_metric
+                       and abs(v - best_per_metric[key]) < 1e-6)
+            cells.append(fmt(v, bold=is_best))
         all_rows.append(cells)
 
     # Column widths
@@ -252,20 +305,20 @@ def _summary_markdown(models, metrics, agg) -> str:
     return "\n".join(lines)
 
 
-def _summary_latex(models, metrics, agg) -> str:
+def _summary_latex(groups, metrics, agg, title="Model Summary", row_header="Model") -> str:
     lines = []
-    lines.append("% Model Summary")
+    lines.append(f"% {title}")
     cols = "l r" + "r" * len(metrics)
     lines.append(f"\\begin{{tabular}}{{{cols}}}")
     lines.append("\\toprule")
-    hdr = "Model & N & " + " & ".join(label for _, label in metrics) + " \\\\"
+    hdr = f"{row_header} & N & " + " & ".join(label for _, label in metrics) + " \\\\"
     lines.append(hdr)
     lines.append("\\midrule")
 
-    for model in models:
-        row_data = agg[model]
+    for g in groups:
+        row_data = agg[g]
         n = row_data.get(f"{metrics[0][0]}_n", 0)
-        cells = [model.replace("_", "\\_"), str(n)]
+        cells = [g.replace("_", "\\_"), str(n)]
         for key, _ in metrics:
             cells.append(fmt_latex(row_data[key]))
         lines.append(" & ".join(cells) + " \\\\")
@@ -285,6 +338,7 @@ MODEL_COLORS = {
     "da3": "#D9534F",
     "da3_chunked": "#5CB85C",
     "da3_pairwise": "#F0AD4E",
+    "openvins": "#9B59B6",
 }
 
 MODEL_DISPLAY = {
@@ -292,6 +346,7 @@ MODEL_DISPLAY = {
     "da3": "DA3 (batch)",
     "da3_chunked": "DA3 (chunked)",
     "da3_pairwise": "DA3 (pairwise)",
+    "openvins": "OpenVINS",
 }
 
 
@@ -494,57 +549,149 @@ def generate_tables(results: list[dict], latex: bool = False) -> str:
     sections.append(pivot_by_scene_and_model(
         results, "auc5", "AUC @ 5°", latex))
 
-    # --- Aggregate summary ---
-    sections.append("## Model Summary\n")
+    # --- Aggregate summaries ---
+    sections.append("## Aggregate Summaries\n")
+    sections.append(scene_summary_table(results, latex))
+    sections.append(course_summary_table(results, latex))
     sections.append(model_summary_table(results, latex))
 
     return "\n".join(sections)
 
 
-def make_output_dir(experiments_dir: str, config_path: str) -> Path:
-    """Create a timestamped output directory and copy the sweep config into it."""
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-    config_stem = Path(config_path).stem
-    out_dir = Path(experiments_dir) / f"sweep_{config_stem}_{timestamp}"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(config_path, out_dir / "sweep_config.yaml")
-    return out_dir
+# ---------------------------------------------------------------------------
+# Per-experiment trajectory comparison plots
+# ---------------------------------------------------------------------------
+
+# Regex to extract model name from trajectory npz filename
+# e.g. metrics_da3_chunked_70f_trajectory.npz → da3_chunked
+#      metrics_streamvggt_70f_trajectory.npz  → streamvggt
+#      metrics_openvins_all_trajectory.npz    → openvins
+_TRAJ_NPZ_RE = re.compile(r"metrics_(.+?)_(?:\d+f|all)_trajectory\.npz$")
+
+
+def generate_trajectory_comparisons(cfg: dict, experiments_dir: str, out_dir: Path):
+    """For each (scene, course) experiment, overlay all methods on one plot."""
+    from goggles.visualization import (
+        discover_sparse_pc,
+        load_sparse_pointcloud,
+        plot_multi_method_trajectories,
+    )
+
+    for scene, course in itertools.product(cfg["scenes"], cfg["courses"]):
+        exp_name = experiment_dir_name(scene, course)
+        exp_dir = Path(experiments_dir) / exp_name
+
+        # Discover all trajectory .npz files
+        npz_files = sorted(glob.glob(str(exp_dir / "*_trajectory.npz")))
+        if not npz_files:
+            continue
+
+        # Load GT and predicted positions from each model.
+        # Models may have different GT subsets (e.g. OpenVINS drops early
+        # frames before init). Use the longest GT as the canonical one.
+        gt_pos = None
+        method_positions = {}
+        for npz_path in npz_files:
+            m = _TRAJ_NPZ_RE.search(Path(npz_path).name)
+            if not m:
+                continue
+            model_key = m.group(1)
+            display_name = MODEL_DISPLAY.get(model_key, model_key)
+            data = np.load(npz_path)
+            method_positions[display_name] = data["pred"]
+            # Keep the longest GT (full trajectory from models that use all frames)
+            if gt_pos is None or len(data["gt"]) > len(gt_pos):
+                gt_pos = data["gt"]
+
+        if not method_positions:
+            continue
+
+        # Load point cloud
+        transforms_path = str(exp_dir / "transforms.json")
+        pc_path = discover_sparse_pc(transforms_path)
+        if pc_path:
+            pcd_pts, pcd_colors = load_sparse_pointcloud(pc_path)
+        else:
+            pcd_pts = np.empty((3, 0))
+            pcd_colors = None
+
+        # Save into the experiment dir (which lives under the sweep dir)
+        plot_path = exp_dir / "comparison_trajectory.png"
+        plot_multi_method_trajectories(
+            gt_pos, method_positions, pcd_pts, pcd_colors,
+            title=f"{exp_name} — all methods",
+            output_path=str(plot_path),
+        )
+
+    print(f"Trajectory comparisons saved to {experiments_dir}")
+
+
+
+
+def resolve_sweep_dir(arg: str) -> tuple[Path, dict]:
+    """Resolve a sweep directory from either a path or a YAML config.
+
+    Accepts:
+      - A sweep directory path (contains sweep_config.yaml + experiment subdirs)
+      - A YAML config path (finds the latest matching sweep dir under experiments)
+
+    Returns:
+        (sweep_dir, cfg) tuple.
+    """
+    arg_path = Path(arg)
+
+    # Case 1: arg is a sweep directory
+    if arg_path.is_dir() and (arg_path / "sweep_config.yaml").is_file():
+        with open(arg_path / "sweep_config.yaml") as f:
+            cfg = yaml.safe_load(f)
+        return arg_path, cfg
+
+    # Case 2: arg is a YAML config — find the latest matching sweep dir
+    if arg_path.is_file() and arg_path.suffix in (".yaml", ".yml"):
+        with open(arg_path) as f:
+            cfg = yaml.safe_load(f)
+        base_dir = Path(cfg.get("experiments_dir", DEFAULT_EXPERIMENTS_DIR))
+        stem = arg_path.stem
+        candidates = sorted(base_dir.glob(f"{stem}_*"), reverse=True)
+        # Filter to dirs that contain sweep_config.yaml
+        candidates = [d for d in candidates if (d / "sweep_config.yaml").is_file()]
+        if candidates:
+            print(f"Found {len(candidates)} sweep(s) for '{stem}', using latest: {candidates[0].name}")
+            return candidates[0], cfg
+        raise FileNotFoundError(
+            f"No sweep directories found matching '{stem}_*' under {base_dir}.\n"
+            f"Run the sweep first: python scripts/run_sweep.py {arg}"
+        )
+
+    raise FileNotFoundError(f"Not a sweep directory or YAML config: {arg}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate tables from sweep results.")
-    parser.add_argument("config", help="Path to sweep YAML config.")
-    parser.add_argument("-o", "--output-dir", default=None,
-                        help="Output directory (default: timestamped dir under experiments).")
+    parser = argparse.ArgumentParser(
+        description="Generate tables and figures from sweep results.",
+        epilog="Accepts either a sweep directory or a YAML config (finds latest sweep).",
+    )
+    parser.add_argument("sweep", help="Sweep directory or YAML config path.")
     parser.add_argument("--latex", action="store_true",
                         help="Output LaTeX tabular instead of markdown.")
     parser.add_argument("--png", action="store_true",
                         help="Generate presentation-ready PNG figure.")
-    parser.add_argument("--experiments-dir", default=None,
-                        help=f"Override experiments directory (default: {DEFAULT_EXPERIMENTS_DIR}).")
     args = parser.parse_args()
 
-    with open(args.config) as f:
-        cfg = yaml.safe_load(f)
-
-    experiments_dir = args.experiments_dir or cfg.get("experiments_dir", DEFAULT_EXPERIMENTS_DIR)
+    sweep_dir, cfg = resolve_sweep_dir(args.sweep)
+    experiments_dir = str(sweep_dir)
     results = load_all_metrics(cfg, experiments_dir)
 
     if not results:
         print("No results found. Run the sweep first:")
-        print(f"  python scripts/run_sweep.py {args.config}")
+        print(f"  python scripts/run_sweep.py {args.sweep}")
         return
 
     print(f"Collected {len(results)} results from {len(set(r['scene'] for r in results))} scenes, "
           f"{len(set(r['model'] for r in results))} models.\n")
 
-    # Resolve output directory
-    if args.output_dir:
-        out_dir = Path(args.output_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(args.config, out_dir / "sweep_config.yaml")
-    else:
-        out_dir = make_output_dir(experiments_dir, args.config)
+    # Output goes into the sweep directory itself
+    out_dir = sweep_dir
 
     # Always generate markdown tables
     tables = generate_tables(results, latex=args.latex)
@@ -559,6 +706,9 @@ def main():
     # Always generate PNG figure
     fig_path = out_dir / "results.png"
     generate_figure(results, str(fig_path))
+
+    # Generate per-experiment multi-method trajectory overlays
+    generate_trajectory_comparisons(cfg, experiments_dir, out_dir)
 
     print(f"\nAll data products in: {out_dir}")
 

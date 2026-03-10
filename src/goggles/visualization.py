@@ -73,6 +73,35 @@ def align_poses_procrustes(pred_w2c, gt_w2c):
     return aligned_c2w, T_align, gt_c2w
 
 
+def align_poses_first_frame(pred_w2c, gt_w2c):
+    """Align predicted poses by matching the first frame to GT.
+
+    Sets T_align such that the first predicted c2w equals the first GT c2w.
+    This reveals how the trajectory drifts over time from a known start.
+
+    Args / Returns: same as align_poses_procrustes.
+    """
+    from vggt.utils.geometry import closed_form_inverse_se3
+
+    pred_c2w = closed_form_inverse_se3(pred_w2c).cpu().double()
+    gt_c2w = closed_form_inverse_se3(gt_w2c.cpu()).double()
+
+    # T_align @ pred_c2w[0] = gt_c2w[0]  =>  T_align = gt_c2w[0] @ inv(pred_c2w[0])
+    T_align = gt_c2w[0] @ torch.linalg.inv(pred_c2w[0])
+
+    aligned_c2w = T_align.unsqueeze(0) @ pred_c2w
+
+    aligned_pos = aligned_c2w[:, :3, 3].numpy()
+    gt_pos = gt_c2w[:, :3, 3].numpy()
+    residuals = np.linalg.norm(aligned_pos - gt_pos, axis=1)
+    logger.info(
+        "First-frame alignment: mean residual=%.4fm, max=%.4fm (frame %d)",
+        residuals.mean(), residuals.max(), residuals.argmax(),
+    )
+
+    return aligned_c2w, T_align, gt_c2w
+
+
 # ---------------------------------------------------------------------------
 # Point cloud loading
 # ---------------------------------------------------------------------------
@@ -268,6 +297,167 @@ def plot_trajectory_on_pointcloud(
             facecolor=fig.get_facecolor(),
         )
         logger.info("Saved trajectory visualization to %s", output_path)
+    else:
+        plt.show()
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# Multi-method comparison visualization
+# ---------------------------------------------------------------------------
+
+# Distinguishable palette (green reserved for GT)
+_METHOD_COLORS = [
+    "#ff4444",  # red
+    "#44aaff",  # blue
+    "#ffaa22",  # orange
+    "#cc44ff",  # purple
+    "#ff44aa",  # pink
+    "#44ffdd",  # cyan
+    "#aaff44",  # lime
+    "#ffff44",  # yellow
+]
+
+
+def plot_multi_method_trajectories(
+    gt_pos,
+    method_positions,
+    pcd_pts,
+    pcd_colors=None,
+    title="",
+    output_path=None,
+    z_band=2.0,
+):
+    """Plot GT and multiple aligned predicted trajectories on a point cloud.
+
+    Args:
+        gt_pos: (N, 3) GT camera positions (NED world frame).
+        method_positions: dict mapping method name -> (M, 3) aligned positions.
+        pcd_pts: (3, K) point cloud XYZ.
+        pcd_colors: (K, 3) RGB in [0,1] or None.
+        title: plot title string.
+        output_path: save path (PNG). If None, calls plt.show().
+        z_band: half-width for z-band filtering around camera altitude.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig = plt.figure(figsize=(12, 10))
+    ax = fig.add_subplot(111, projection="3d")
+
+    # Dark theme
+    ax.set_facecolor("#1a1a2e")
+    fig.patch.set_facecolor("#0f0f1a")
+
+    # NED -> display (Z-up)
+    gt_disp = gt_pos.copy()
+    gt_disp[:, 2] *= -1
+    methods_disp = {}
+    for name, pos in method_positions.items():
+        d = pos.copy()
+        d[:, 2] *= -1
+        methods_disp[name] = d
+    pcd_disp = pcd_pts.copy()
+    pcd_disp[2, :] *= -1
+
+    # Z-band filter
+    all_z = [gt_disp[:, 2]]
+    for pos in methods_disp.values():
+        all_z.append(pos[:, 2])
+    altitude = float(np.median(np.concatenate(all_z)))
+    if pcd_disp.shape[1] > 0:
+        z_mask = np.abs(pcd_disp[2, :] - altitude) <= z_band
+        vis_pts = pcd_disp[:, z_mask]
+        vis_colors = pcd_colors[z_mask] if pcd_colors is not None else None
+    else:
+        vis_pts = pcd_disp
+        vis_colors = pcd_colors
+
+    # Point cloud
+    if vis_pts.shape[1] > 0:
+        kw = dict(s=0.3, alpha=0.3, rasterized=True, depthshade=False)
+        if vis_colors is not None:
+            ax.scatter(vis_pts[0], vis_pts[1], vis_pts[2], c=vis_colors, **kw)
+        else:
+            ax.scatter(vis_pts[0], vis_pts[1], vis_pts[2], c="#888888", **kw)
+
+    # GT trajectory (green, thicker)
+    ax.plot(
+        gt_disp[:, 0], gt_disp[:, 1], gt_disp[:, 2],
+        color="#44ff44", linewidth=2.0, alpha=0.9, label="GT",
+    )
+    ax.scatter(
+        *gt_disp[0], color="#44ff44", s=60, marker="o",
+        edgecolors="white", linewidths=0.5, zorder=5,
+    )
+    ax.scatter(
+        *gt_disp[-1], color="#44ff44", s=80, marker="x",
+        linewidths=2, zorder=5,
+    )
+
+    # Method trajectories
+    all_pts_list = [gt_disp]
+    for idx, (name, disp) in enumerate(methods_disp.items()):
+        color = _METHOD_COLORS[idx % len(_METHOD_COLORS)]
+        all_pts_list.append(disp)
+
+        ax.plot(
+            disp[:, 0], disp[:, 1], disp[:, 2],
+            color=color, linewidth=1.5, alpha=0.85, label=name,
+        )
+        ax.scatter(
+            *disp[0], color=color, s=50, marker="o",
+            edgecolors="white", linewidths=0.5, zorder=5,
+        )
+        ax.scatter(
+            *disp[-1], color=color, s=70, marker="x",
+            linewidths=2, zorder=5,
+        )
+
+    # Axis labels
+    ax.set_xlabel("X (m)", color="white", fontsize=10)
+    ax.set_ylabel("Y (m)", color="white", fontsize=10)
+    ax.set_zlabel("Z (m)", color="white", fontsize=10)
+    ax.tick_params(colors="white")
+
+    # Legend
+    ax.legend(
+        loc="upper right", fontsize=9,
+        facecolor="#2a2a3e", edgecolor="#555555", labelcolor="white",
+    )
+
+    if title:
+        ax.set_title(title, color="white", fontweight="bold", fontsize=12)
+
+    # Scale axes to GT trajectory only (drifty methods clip, GT stays readable)
+    mins, maxs = gt_disp.min(axis=0), gt_disp.max(axis=0)
+    max_range = max((maxs - mins).max() * 1.2, 0.1)
+    centers = (mins + maxs) / 2
+    for setter, c in [
+        (ax.set_xlim, centers[0]),
+        (ax.set_ylim, centers[1]),
+        (ax.set_zlim, centers[2]),
+    ]:
+        setter(c - max_range / 2, c + max_range / 2)
+    ax.set_box_aspect([1, 1, 1])
+    ax.view_init(elev=30, azim=45)
+
+    # Pane / grid styling
+    for axis in [ax.xaxis, ax.yaxis, ax.zaxis]:
+        axis.pane.fill = False
+        axis.pane.set_edgecolor((0.1, 0.1, 0.1, 0.3))
+        axis._axinfo["grid"]["color"] = (1, 1, 1, 0.05)
+        axis._axinfo["grid"]["linewidth"] = 0.3
+        axis.line.set_color("#555555")
+
+    fig.tight_layout()
+    if output_path:
+        fig.savefig(
+            output_path, dpi=150, bbox_inches="tight",
+            facecolor=fig.get_facecolor(),
+        )
+        logger.info("Saved multi-method trajectory plot to %s", output_path)
     else:
         plt.show()
     plt.close(fig)
