@@ -81,6 +81,7 @@ def extract_gt_poses_w2c(transforms):
     Returns:
         [N, 4, 4] float64 tensor of w2c poses in OpenCV camera convention.
     """
+    #TODO: Remove vggt dependency
     from vggt.utils.geometry import closed_form_inverse_se3
 
     c2w_list = []
@@ -93,6 +94,7 @@ def extract_gt_poses_w2c(transforms):
         c2w_list.append(c2w)
 
     c2w = torch.from_numpy(np.stack(c2w_list))  # [N, 4, 4]
+    #TODO: implement closed_form_inverse_se3 directly
     w2c = closed_form_inverse_se3(c2w)  # [N, 4, 4]
     return w2c
 
@@ -428,9 +430,10 @@ def main():
     )
     parser.add_argument(
         "--model",
-        choices=["streamvggt", "da3", "da3_chunked", "da3_pairwise", "openvins"],
+        choices=["streamvggt", "da3", "da3_chunked", "da3_pairwise", "openvins", "reloc3r"],
         default="streamvggt",
-        help="Pose prediction model (default: streamvggt).",
+        help="Pose prediction model (default: streamvggt).\n"\
+             "reloc3r uses first+last frames as anchors (batch). "
     )
     parser.add_argument(
         "--checkpoint", default=None,
@@ -439,6 +442,10 @@ def main():
     parser.add_argument(
         "--da3-model-name", default=None,
         help="DA3 HuggingFace model ID (default: depth-anything/DA3-LARGE-1.1).",
+    )
+    parser.add_argument(
+        "--img-reso", type=int, default=512, choices=[224, 512],
+        help="Reloc3r image resolution (default: 512).",
     )
     parser.add_argument(
         "--device", default="cuda",
@@ -717,6 +724,22 @@ def main():
         # OpenVINS doesn't preprocess images — use GT resolution
         preprocessed_hw = None
 
+    elif args.model == "reloc3r":
+        
+        from goggles.reloc3r_predictor import Reloc3rPredictor
+
+        predictor = Reloc3rPredictor(
+            img_reso=args.img_reso,
+            device=args.device,
+        )
+        device = predictor.device
+        preprocessed_hw = (args.img_reso, args.img_reso)
+
+        logger.info(
+            "Running Reloc3r-%d inference (%d frames)...", args.img_reso, num_frames
+        )
+        pred_w2c, pred_intrinsics = predictor.predict_poses(image_paths)
+
     logger.info("Predicted poses: %s", list(pred_w2c.shape))
 
     # ------------------------------------------------------------------
@@ -747,6 +770,7 @@ def main():
     from goggles.pose_eval import se3_to_relative_pose_error, compute_pose_metrics
 
     gt_w2c = gt_w2c.to(device)
+    pred_w2c = pred_w2c.to(device)
     rel_r_err, rel_t_err = se3_to_relative_pose_error(pred_w2c, gt_w2c, num_frames)
 
     r_error_np = rel_r_err.cpu().numpy()

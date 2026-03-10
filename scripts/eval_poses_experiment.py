@@ -118,11 +118,16 @@ def main():
     # Pass-through pose model args
     parser.add_argument(
         "--model",
-        choices=["streamvggt", "da3", "da3_chunked", "da3_pairwise", "openvins"],
+        choices=["streamvggt", "da3", "da3_chunked", "da3_pairwise", "openvins", "reloc3r"],
         default="streamvggt",
-        help="Pose prediction model (default: streamvggt).",
+        help="Pose prediction model (default: streamvggt).\n"\
+             "reloc3r uses first+last frames as anchors (batch). "
     )
     parser.add_argument("--da3-model-name", default=None)
+    parser.add_argument(
+        "--img-reso", type=int, default=512, choices=[224, 512],
+        help="Reloc3r image resolution (default: 512).",
+    )
     parser.add_argument(
         "--window-size", type=int, default=None,
         help="Sliding window size for KV-cache trimming (StreamVGGT only).",
@@ -314,7 +319,7 @@ def main():
     # ------------------------------------------------------------------
     # Streaming models process ALL frames; batch models use -n subsampling
     is_streaming = (
-        args.model in ("da3_pairwise", "openvins")
+        args.model in ("da3_pairwise", "openvins", "reloc3r")
         or (args.model == "streamvggt" and args.window_size is not None)
     )
     if is_streaming:
@@ -342,6 +347,8 @@ def main():
             eval_cmd += ["--overlap", str(args.overlap)]
         if args.model == "openvins" and openvins_tum_path:
             eval_cmd += ["--openvins-trajectory", str(openvins_tum_path)]
+        if args.model == "reloc3r":
+            eval_cmd += ["--img-reso", str(args.img_reso)]
 
         # Point cloud: prefer NED-frame sparse_pc_ned.ply (saved by simulate CLI)
         # over COLMAP-frame sparse_pc.ply (wrong coordinate system)
