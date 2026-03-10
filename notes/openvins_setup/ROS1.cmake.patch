@@ -1,0 +1,19 @@
+diff --git a/ov_msckf/cmake/ROS1.cmake b/ov_msckf/cmake/ROS1.cmake
+index 2ea4292..db50b64 100644
+--- a/ov_msckf/cmake/ROS1.cmake
++++ b/ov_msckf/cmake/ROS1.cmake
+@@ -158,3 +158,14 @@ install(TARGETS test_sim_repeat
+         RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+ )
+ 
++# ROS-free file-based driver for offline VIO from IMU CSV + images
++if (NOT catkin_FOUND OR NOT ENABLE_ROS)
++    add_executable(run_from_files src/run_from_files.cpp)
++    target_link_libraries(run_from_files ov_msckf_lib ${thirdparty_libraries})
++    install(TARGETS run_from_files
++            ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
++            LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
++            RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
++    )
++endif ()
++

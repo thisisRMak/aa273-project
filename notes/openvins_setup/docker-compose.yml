@@ -1,0 +1,25 @@
+# OpenVINS ROS-free container for offline VIO benchmarking.
+#
+# Build: docker compose build
+# Usage: docker compose run --rm openvins
+#
+# The run_from_files binary is at /opt/open_vins/ov_msckf/build/run_from_files
+
+services:
+  openvins:
+    image: openvins:rosfree
+    build:
+      context: .
+      dockerfile: Dockerfile.rosfree
+    volumes:
+      # Mount source for config edits without rebuild
+      - ./config:/opt/open_vins/config
+      # Mount data directory (same path as host so symlinks work)
+      - ${DATA_PATH:-/media/admin/data/StanfordMSL}:${DATA_PATH:-/media/admin/data/StanfordMSL}
+      # Mount FiGS workspace for image access
+      - ${FIGS_PATH:-../FiGS-Standalone}/3dgs/workspace:/workspace/3dgs
+      # Output directory
+      - ./output:/opt/open_vins/output
+    working_dir: /opt/open_vins
+    stdin_open: true
+    tty: true

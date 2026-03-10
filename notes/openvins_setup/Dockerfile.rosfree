@@ -1,0 +1,30 @@
+# OpenVINS ROS-free build — minimal Ubuntu 22.04 with only C++ dependencies.
+# No ROS installation. Produces the run_from_files binary for offline VIO.
+#
+# Build:  docker compose build
+# Usage:  docker compose run --rm openvins
+
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Core build tools + OpenVINS dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake git \
+    libeigen3-dev \
+    libceres-dev \
+    libopencv-dev \
+    libboost-all-dev \
+    libgoogle-glog-dev libgflags-dev libatlas-base-dev libsuitesparse-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy source and build ROS-free
+COPY . /opt/open_vins
+WORKDIR /opt/open_vins/ov_msckf
+
+RUN mkdir -p build && cd build && \
+    cmake -DENABLE_ROS=OFF -DENABLE_ARUCO_TAGS=OFF -DDISABLE_MATPLOTLIB=ON \
+          -DCMAKE_BUILD_TYPE=Release .. && \
+    make -j$(nproc)
+
+WORKDIR /opt/open_vins

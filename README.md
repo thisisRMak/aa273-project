@@ -11,14 +11,11 @@ GOGGLES runs inside Docker and depends on sibling repositories that should live 
 ```
 StanfordMSL/
 ├── GOGGLES/                  # this repo
-├── Depth-Anything-3/         # github.com/ByteDance-Seed/Depth-Anything-3 (raw git clone)
 ├── StreamVGGT/               # github.com/wzzheng/StreamVGGT (raw git clone)
+├── Depth-Anything-3/         # github.com/ByteDance-Seed/Depth-Anything-3 (raw git clone)
 ├── reloc3r/                  # https://github.com/ffrivera0/reloc3r (git clone, build croco)
-├── open_vins/                # https://github.com/rpng/open_vins.git (raw git clone)
-├── ov_ws/                    # colcon workspace built from open_vins/ (created by build_open_vins.sh)
+├── open_vins/                # https://github.com/rpng/open_vins.git + our ROS-free additions
 ├── FiGS-Standalone/          # 3DGS integration (provides the base Docker image)
-├── open_vins/                # OpenVINS ROS-free fork (VIO baseline)
-├── Depth-Anything-3/         # DA3 depth + pose estimation
 └── coverage_view_selection/  # nbv-splat + custom nerfstudio fork
 ```
 
@@ -72,7 +69,21 @@ cd /path/to/StanfordMSL
 git clone https://github.com/rpng/open_vins.git
 ```
 
-#TODO: How is OpenVINS setup
+Then apply our custom ROS-free build files (stored in `notes/openvins_setup/`):
+
+```bash
+cd open_vins
+cp ../GOGGLES/notes/openvins_setup/Dockerfile.rosfree .
+cp ../GOGGLES/notes/openvins_setup/docker-compose.yml .
+cp ../GOGGLES/notes/openvins_setup/run_from_files.cpp ov_msckf/src/
+cp -r ../GOGGLES/notes/openvins_setup/config_flightroom config/flightroom
+cp ../GOGGLES/notes/openvins_setup/euroc_to_files.py scripts/
+cp ../GOGGLES/notes/openvins_setup/uzhfpv_to_files.py scripts/
+git apply ../GOGGLES/notes/openvins_setup/ROS1.cmake.patch
+docker compose build
+```
+
+This builds `openvins:rosfree` — a minimal Ubuntu 22.04 image with the `run_from_files` binary (no ROS). See `notes/openvins_setup/README.md` for details on what we changed from upstream.
 
 ### 6. Clone Depth-Anything-3
 
@@ -372,4 +383,14 @@ Unlike StreamVGGT (which lives under a `src/` subdirectory), reloc3r's package d
 
 ## How OpenVINS is integrated
 
-#TODO
+Unlike the other models, OpenVINS runs in its own Docker container (`openvins:rosfree`), not inside the GOGGLES container. This is because OpenVINS is a C++ application with its own system dependencies (Ceres, Eigen3, OpenCV) that would conflict with the Python/CUDA environment.
+
+The upstream `rpng/open_vins` repo only supports ROS1/ROS2 builds. We added:
+
+- **`run_from_files.cpp`** — Standalone C++ driver that reads IMU CSV + image timestamps instead of ROS bags
+- **`Dockerfile.rosfree`** — Minimal build with `-DENABLE_ROS=OFF`
+- **`config/flightroom/`** — Camera/IMU config derived from FiGS `carl.json`
+
+All of these files are stored in `notes/openvins_setup/` for portability. The GOGGLES container invokes OpenVINS via the Docker socket (`/var/run/docker.sock`), passing data through the shared data mount.
+
+See `notes/openvins_setup/README.md` for full setup instructions from a fresh clone.

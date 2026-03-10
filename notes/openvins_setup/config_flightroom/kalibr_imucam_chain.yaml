@@ -1,0 +1,29 @@
+%YAML:1.0
+
+# Camera calibration for FiGS flightroom (carl.json drone frame).
+#
+# T_imu_cam: OpenCV camera frame → FLU (z-up) IMU/body frame.
+#
+# OpenVINS uses OpenCV camera convention (x-right, y-down, z-forward)
+# internally for feature tracking.  FiGS/carl.json defines the camera
+# in OpenGL convention (x-right, y-up, z-backward).
+#
+# Derivation:
+#   1. carl.json camera_to_body_transform (OpenGL cam → FRD body)
+#   2. FRD → FLU: R_flu = diag(1,-1,-1) @ R_frd
+#   3. OpenGL → OpenCV: T_opencv = T_opengl @ diag(1,-1,-1,1)
+#   Result: T_imu_cam = (step 2 result) @ diag(1,-1,-1,1)
+
+cam0:
+  T_imu_cam:
+    - [ 0.0,  0.0,  1.0,  0.10]
+    - [-1.0,  0.0,  0.0,  0.03]
+    - [ 0.0, -1.0,  0.0,  0.01]
+    - [ 0.0,  0.0,  0.0,  1.00]
+  cam_overlaps: []
+  camera_model: pinhole
+  distortion_coeffs: [0.0, 0.0, 0.0, 0.0]
+  distortion_model: radtan
+  intrinsics: [462.956, 463.002, 323.076, 181.184]  # fu, fv, cu, cv
+  resolution: [640, 360]
+  rostopic: /cam0/image_raw
