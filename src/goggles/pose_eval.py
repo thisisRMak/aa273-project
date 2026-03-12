@@ -7,8 +7,7 @@ All functions operate on world-to-camera (w2c) 4x4 SE(3) tensors.
 
 import torch
 import numpy as np
-from vggt.utils.rotation import mat_to_quat
-from vggt.utils.geometry import closed_form_inverse_se3
+from goggles.geometry import mat_to_quat, closed_form_inverse_se3
 
 
 def build_pair_index(N, B=1):

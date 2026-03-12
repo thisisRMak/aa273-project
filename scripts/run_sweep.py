@@ -83,9 +83,10 @@ def sweep_dir_name(config_path: str) -> str:
 
 def is_streaming_model(model: str, cfg: dict) -> bool:
     """Check if a model runs in streaming mode (processes all frames)."""
+    base = model[4:] if model.startswith("ekf_") else model
     return (
-        model in ("da3_pairwise", "openvins", "reloc3r")
-        or (model == "streamvggt" and cfg.get("window_size") is not None)
+        base in ("da3_pairwise", "openvins", "reloc3r")
+        or (base == "streamvggt" and cfg.get("window_size") is not None)
     )
 
 
@@ -127,15 +128,17 @@ def run_single(
     ]
 
     # Optional pass-through args from sweep config
-    if cfg.get("chunk_size") is not None and model == "da3_chunked":
+    base = model[4:] if model.startswith("ekf_") else model
+    if cfg.get("chunk_size") is not None and base == "da3_chunked":
         cmd += ["--chunk-size", str(cfg["chunk_size"])]
-    if cfg.get("overlap") is not None and model == "da3_chunked":
+    if cfg.get("overlap") is not None and base == "da3_chunked":
         cmd += ["--overlap", str(cfg["overlap"])]
-    if cfg.get("window_size") is not None and model == "streamvggt":
+    if cfg.get("window_size") is not None and base == "streamvggt":
         cmd += ["--window-size", str(cfg["window_size"])]
-    if model == "openvins":
+    if base == "openvins":
         if cfg.get("openvins_config") is not None:
             cmd += ["--openvins-config", str(cfg["openvins_config"])]
+    if base == "openvins" or model.startswith("ekf_"):
         if cfg.get("imu_noise") is not None:
             cmd += ["--imu-noise", str(cfg["imu_noise"])]
     for key in ("rollout", "frame", "policy"):

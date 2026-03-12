@@ -81,8 +81,7 @@ def extract_gt_poses_w2c(transforms):
     Returns:
         [N, 4, 4] float64 tensor of w2c poses in OpenCV camera convention.
     """
-    #TODO: Remove vggt dependency
-    from vggt.utils.geometry import closed_form_inverse_se3
+    from goggles.geometry import closed_form_inverse_se3
 
     c2w_list = []
     for frame in transforms["frames"]:
@@ -94,7 +93,6 @@ def extract_gt_poses_w2c(transforms):
         c2w_list.append(c2w)
 
     c2w = torch.from_numpy(np.stack(c2w_list))  # [N, 4, 4]
-    #TODO: implement closed_form_inverse_se3 directly
     w2c = closed_form_inverse_se3(c2w)  # [N, 4, 4]
     return w2c
 
@@ -430,7 +428,7 @@ def main():
     )
     parser.add_argument(
         "--model",
-        choices=["streamvggt", "da3", "da3_chunked", "da3_pairwise", "openvins", "reloc3r"],
+        choices=["streamvggt", "da3", "da3_chunked", "da3_pairwise", "depth_pnp", "openvins", "reloc3r"],
         default="streamvggt",
         help="Pose prediction model (default: streamvggt).\n"\
              "reloc3r uses first+last frames as anchors (batch). "
@@ -495,6 +493,18 @@ def main():
     parser.add_argument(
         "--openvins-trajectory", default=None,
         help="Path to TUM-format trajectory file (openvins model only).",
+    )
+    parser.add_argument(
+        "--ekf", action="store_true",
+        help="Post-process vision poses through IMU-vision EKF fusion.",
+    )
+    parser.add_argument(
+        "--imu-csv", default=None,
+        help="Path to IMU CSV file (required when --ekf is set).",
+    )
+    parser.add_argument(
+        "--image-timestamps-csv", default=None,
+        help="Path to image_timestamps.csv (for EKF vision timestamps).",
     )
 
     args = parser.parse_args()
@@ -651,6 +661,19 @@ def main():
         logger.info("Running DA3 pairwise inference (%d frames)...", num_frames)
         pred_w2c, pred_intrinsics = predictor.predict_poses(image_paths)
 
+    elif args.model == "depth_pnp":
+        from goggles.depth_pnp_predictor import DepthPnPPredictor
+
+        predictor = DepthPnPPredictor(
+            model_name=args.da3_model_name,
+            device=args.device,
+        )
+        device = predictor.device
+        preprocessed_hw = (504, 504)
+
+        logger.info("Running Depth-PnP inference (%d frames)...", num_frames)
+        pred_w2c, pred_intrinsics = predictor.predict_poses(image_paths)
+
     elif args.model == "openvins":
         from goggles.tum_utils import load_tum_trajectory
 
@@ -741,6 +764,48 @@ def main():
         pred_w2c, pred_intrinsics = predictor.predict_poses(image_paths)
 
     logger.info("Predicted poses: %s", list(pred_w2c.shape))
+
+    # ------------------------------------------------------------------
+    # EKF fusion (optional, post-processes any model's output)
+    # ------------------------------------------------------------------
+    if args.ekf:
+        if not args.imu_csv:
+            logger.error("--ekf requires --imu-csv")
+            sys.exit(1)
+
+        from goggles.imu_ekf import IMUVisionEKF
+
+        # Load vision timestamps
+        if args.image_timestamps_csv:
+            vision_ts = []
+            with open(args.image_timestamps_csv) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    vision_ts.append(float(line.split(",")[0]))
+            vision_ts = np.array(vision_ts)
+
+            # Match timestamps to the (possibly subsampled) frame set
+            if len(vision_ts) != num_frames:
+                # Subsampled: pick the timestamps corresponding to selected frames
+                if hasattr(args, '_frame_indices') and args._frame_indices is not None:
+                    vision_ts = vision_ts[args._frame_indices]
+                else:
+                    # Uniform subsample from all timestamps
+                    indices = np.linspace(0, len(vision_ts) - 1, num_frames, dtype=int)
+                    vision_ts = vision_ts[indices]
+        else:
+            # Generate synthetic timestamps from frame count and trajectory duration
+            imu_data = np.loadtxt(args.imu_csv, delimiter=",", comments="#")
+            t_start, t_end = imu_data[0, 0], imu_data[-1, 0]
+            vision_ts = np.linspace(t_start, t_end, num_frames)
+
+        pred_w2c_np = pred_w2c.cpu().numpy()
+        ekf = IMUVisionEKF(args.imu_csv)
+        fused_w2c_np = ekf.fuse(pred_w2c_np, vision_ts)
+        pred_w2c = torch.from_numpy(fused_w2c_np).to(device)
+        logger.info("EKF fusion complete: %d poses", num_frames)
 
     # ------------------------------------------------------------------
     # Diagnostic: print poses for convention debugging (--verbose)

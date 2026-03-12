@@ -32,7 +32,7 @@ def align_poses_procrustes(pred_w2c, gt_w2c):
         T_align: [4, 4] alignment transform (pred world -> GT world).
         gt_c2w: [N, 4, 4] GT c2w for reference.
     """
-    from vggt.utils.geometry import closed_form_inverse_se3
+    from goggles.geometry import closed_form_inverse_se3
 
     pred_c2w = closed_form_inverse_se3(pred_w2c).cpu().double()
     gt_c2w = closed_form_inverse_se3(gt_w2c.cpu()).double()
@@ -81,7 +81,7 @@ def align_poses_first_frame(pred_w2c, gt_w2c):
 
     Args / Returns: same as align_poses_procrustes.
     """
-    from vggt.utils.geometry import closed_form_inverse_se3
+    from goggles.geometry import closed_form_inverse_se3
 
     pred_c2w = closed_form_inverse_se3(pred_w2c).cpu().double()
     gt_c2w = closed_form_inverse_se3(gt_w2c.cpu()).double()

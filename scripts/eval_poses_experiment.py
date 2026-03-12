@@ -5,11 +5,16 @@ Chains two stages:
   1. Simulate flight in GSplat scene → video + GT poses
   2. Evaluate pose predictions against GT
 
-Supported models: streamvggt, da3, da3_chunked, da3_pairwise, openvins.
+Supported models: streamvggt, da3, da3_chunked, da3_pairwise, openvins, reloc3r.
+EKF-fused variants: ekf_streamvggt, ekf_da3_pairwise, ekf_reloc3r, etc.
 
 OpenVINS runs in a separate Docker container (openvins:rosfree) via the
 Docker socket. Before evaluation, it synthesizes IMU data from the saved
 tXUd trajectory and calls the OpenVINS binary to produce TUM-format poses.
+
+EKF-fused models (ekf_<base>) synthesize IMU from tXUd, run the base model,
+then post-process vision poses through a 15-state error-state EKF that fuses
+IMU propagation with the foundation model's pose measurements.
 
 Usage:
     # Full pipeline
@@ -116,12 +121,13 @@ def main():
         help="Path to sparse_pc.ply for trajectory visualization.",
     )
     # Pass-through pose model args
+    VISION_MODELS = ["streamvggt", "da3", "da3_chunked", "da3_pairwise", "depth_pnp", "openvins", "reloc3r"]
+    EKF_MODELS = [f"ekf_{m}" for m in VISION_MODELS if m != "openvins"]
     parser.add_argument(
         "--model",
-        choices=["streamvggt", "da3", "da3_chunked", "da3_pairwise", "openvins", "reloc3r"],
+        choices=VISION_MODELS + EKF_MODELS,
         default="streamvggt",
-        help="Pose prediction model (default: streamvggt).\n"\
-             "reloc3r uses first+last frames as anchors (batch). "
+        help="Pose prediction model. Prefix with 'ekf_' for IMU-vision EKF fusion.",
     )
     parser.add_argument("--da3-model-name", default=None)
     parser.add_argument(
@@ -159,6 +165,13 @@ def main():
     parser.add_argument("--policy", default="vrmpc_rrt")
 
     args = parser.parse_args()
+
+    # ------------------------------------------------------------------
+    # Parse EKF prefix: ekf_da3_pairwise → base_model=da3_pairwise, use_ekf=True
+    # ------------------------------------------------------------------
+    use_ekf = args.model.startswith("ekf_")
+    base_model = args.model[4:] if use_ekf else args.model
+    full_model_name = args.model  # preserve for metrics filename
 
     # ------------------------------------------------------------------
     # Resolve paths
@@ -219,20 +232,25 @@ def main():
         sys.exit(1)
 
     # ------------------------------------------------------------------
-    # Stage 1.5: OPENVINS PREP (only for --model openvins)
+    # Stage 1.5: IMU SYNTHESIS (for openvins and ekf_ models)
     # ------------------------------------------------------------------
+    imu_csv = None
+    image_ts_csv = None
     openvins_tum_path = None
-    if args.model == "openvins" and skip_idx <= 1:
+    needs_imu = base_model == "openvins" or use_ekf
+    if needs_imu and skip_idx <= 1:
         tXUd_path = exp_dir / "tXUd.npy"
         if not tXUd_path.is_file():
             logger.error("No tXUd.npy in %s. Re-run simulation (tXUd saving was added recently).", exp_dir)
             sys.exit(1)
 
-        openvins_dir = exp_dir / "openvins"
-        openvins_dir.mkdir(exist_ok=True)
-        imu_csv = openvins_dir / "imu.csv"
-        image_ts_csv = openvins_dir / "image_timestamps.csv"
-        openvins_tum_path = openvins_dir / "poses_tum.txt"
+        # IMU data goes in openvins/ for openvins, imu/ for ekf models
+        imu_dir = exp_dir / ("openvins" if base_model == "openvins" else "imu")
+        imu_dir.mkdir(exist_ok=True)
+        imu_csv = imu_dir / "imu.csv"
+        image_ts_csv = imu_dir / "image_timestamps.csv"
+        if base_model == "openvins":
+            openvins_tum_path = imu_dir / "poses_tum.txt"
 
         # 1. Synthesize IMU from tXUd (runs in this container, Python only)
         if not imu_csv.is_file() or args.force:
@@ -265,19 +283,19 @@ def main():
         else:
             logger.info("Image timestamps exist, skipping (use --force to re-run)")
 
-        # 3. Run OpenVINS via Docker (cross-container call)
+        # 3. Run OpenVINS via Docker (only for --model openvins, not ekf_ models)
         #    We use `docker run` with the pre-built openvins:rosfree image.
         #    Path challenge: `-v` source paths must be HOST paths, but we're
         #    inside the GOGGLES container. Solution: copy config into exp_dir
         #    (on the shared data mount, same path in both containers) and
         #    reference everything from there.
-        if not openvins_tum_path.is_file() or args.force:
+        if base_model == "openvins" and (not openvins_tum_path.is_file() or args.force):
             import shutil
 
             openvins_binary = "/opt/open_vins/ov_msckf/build/run_from_files"
 
             # Copy OpenVINS config into experiment dir (shared mount)
-            config_dest = openvins_dir / "config"
+            config_dest = imu_dir / "config"
             if config_dest.exists():
                 shutil.rmtree(config_dest)
             shutil.copytree(args.openvins_config, config_dest)
@@ -303,37 +321,38 @@ def main():
         else:
             logger.info("OpenVINS poses exist, skipping (use --force to re-run)")
 
-        if not openvins_tum_path.is_file():
-            logger.error("OpenVINS did not produce poses at %s", openvins_tum_path)
-            sys.exit(1)
+        if base_model == "openvins":
+            if not openvins_tum_path.is_file():
+                logger.error("OpenVINS did not produce poses at %s", openvins_tum_path)
+                sys.exit(1)
 
-        # Check that poses were actually written (not just an empty/header-only file)
-        num_poses = sum(1 for line in open(openvins_tum_path)
-                        if line.strip() and not line.startswith("#"))
-        if num_poses == 0:
-            logger.error("OpenVINS wrote 0 poses — initialization likely failed. "
-                          "Check init_max_disparity in config.")
-            sys.exit(1)
-        logger.info("OpenVINS produced %d poses", num_poses)
+            # Check that poses were actually written (not just an empty/header-only file)
+            num_poses = sum(1 for line in open(openvins_tum_path)
+                            if line.strip() and not line.startswith("#"))
+            if num_poses == 0:
+                logger.error("OpenVINS wrote 0 poses — initialization likely failed. "
+                              "Check init_max_disparity in config.")
+                sys.exit(1)
+            logger.info("OpenVINS produced %d poses", num_poses)
 
     # ------------------------------------------------------------------
     # Stage 2: EVALUATE
     # ------------------------------------------------------------------
     # Streaming models process ALL frames; batch models use -n subsampling
     is_streaming = (
-        args.model in ("da3_pairwise", "openvins", "reloc3r")
-        or (args.model == "streamvggt" and args.window_size is not None)
+        base_model in ("da3_pairwise", "depth_pnp", "openvins", "reloc3r")
+        or (base_model == "streamvggt" and args.window_size is not None)
     )
     if is_streaming:
-        metrics_stem = f"metrics_{args.model}_all"
+        metrics_stem = f"metrics_{full_model_name}_all"
     else:
-        metrics_stem = f"metrics_{args.model}_{args.num_frames}f"
+        metrics_stem = f"metrics_{full_model_name}_{args.num_frames}f"
 
     if skip_idx <= 1:
         eval_cmd = [
             sys.executable, str(eval_script),
             "--transforms", str(exp_dir / "transforms.json"),
-            "--model", args.model,
+            "--model", base_model,
             "-o", str(exp_dir / f"{metrics_stem}.json"),
             "--plot",
             "--visualize",
@@ -344,13 +363,19 @@ def main():
             eval_cmd += ["--da3-model-name", args.da3_model_name]
         if args.window_size is not None:
             eval_cmd += ["--window-size", str(args.window_size)]
-        if args.model == "da3_chunked":
+        if base_model == "da3_chunked":
             eval_cmd += ["--chunk-size", str(args.chunk_size)]
             eval_cmd += ["--overlap", str(args.overlap)]
-        if args.model == "openvins" and openvins_tum_path:
+        if base_model == "openvins" and openvins_tum_path:
             eval_cmd += ["--openvins-trajectory", str(openvins_tum_path)]
-        if args.model == "reloc3r":
+        if base_model == "reloc3r":
             eval_cmd += ["--img-reso", str(args.img_reso)]
+
+        # EKF fusion: pass IMU data to eval_poses.py
+        if use_ekf and imu_csv:
+            eval_cmd += ["--ekf", "--imu-csv", str(imu_csv)]
+            if image_ts_csv and image_ts_csv.is_file():
+                eval_cmd += ["--image-timestamps-csv", str(image_ts_csv)]
 
         # Point cloud: prefer NED-frame sparse_pc_ned.ply (saved by simulate CLI)
         # over COLMAP-frame sparse_pc.ply (wrong coordinate system)
@@ -375,9 +400,11 @@ def main():
     output_files = ["video.mp4", "transforms.json", "tXUd.npy", "sparse_pc_ned.ply",
                     f"{metrics_stem}.json", f"{metrics_stem}.png",
                     f"{metrics_stem}_trajectory.png"]
-    if args.model == "openvins":
+    if base_model == "openvins":
         output_files += ["openvins/imu.csv", "openvins/image_timestamps.csv",
                           "openvins/poses_tum.txt"]
+    elif use_ekf:
+        output_files += ["imu/imu.csv", "imu/image_timestamps.csv"]
     for name in output_files:
         path = exp_dir / name
         status = "OK" if path.exists() else "missing"
