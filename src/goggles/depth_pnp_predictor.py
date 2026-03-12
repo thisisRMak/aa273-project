@@ -148,9 +148,11 @@ class DepthPnPPredictor:
         )
         if pts_back is not None:
             fb_good = status_back.ravel() == 1
-            fb_dist = np.linalg.norm(
-                pts_prev - pts_back[fb_good].reshape(-1, 2), axis=1
-            ) if np.sum(fb_good) == len(pts_prev) else np.full(len(pts_prev), 999.0)
+            # Compute FB distance for all points (failed backward tracks get 999)
+            fb_dist = np.full(len(pts_prev), 999.0)
+            fb_dist[fb_good] = np.linalg.norm(
+                pts_prev[fb_good] - pts_back[fb_good].reshape(-1, 2), axis=1
+            )
             # Keep features with < 1 pixel forward-backward error
             mask = fb_dist < 1.0
             pts_prev = pts_prev[mask]

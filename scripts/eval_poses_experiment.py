@@ -121,7 +121,7 @@ def main():
         help="Path to sparse_pc.ply for trajectory visualization.",
     )
     # Pass-through pose model args
-    VISION_MODELS = ["streamvggt", "da3", "da3_chunked", "da3_pairwise", "depth_pnp", "openvins", "reloc3r"]
+    VISION_MODELS = ["streamvggt", "da3", "da3_chunked", "da3_pairwise", "depth_pnp", "da3_metric_pairwise", "openvins", "reloc3r"]
     EKF_MODELS = [f"ekf_{m}" for m in VISION_MODELS if m != "openvins"]
     parser.add_argument(
         "--model",
@@ -340,7 +340,7 @@ def main():
     # ------------------------------------------------------------------
     # Streaming models process ALL frames; batch models use -n subsampling
     is_streaming = (
-        base_model in ("da3_pairwise", "depth_pnp", "openvins", "reloc3r")
+        base_model in ("da3_pairwise", "depth_pnp", "da3_metric_pairwise", "openvins", "reloc3r")
         or (base_model == "streamvggt" and args.window_size is not None)
     )
     if is_streaming:

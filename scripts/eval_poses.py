@@ -428,7 +428,7 @@ def main():
     )
     parser.add_argument(
         "--model",
-        choices=["streamvggt", "da3", "da3_chunked", "da3_pairwise", "depth_pnp", "openvins", "reloc3r"],
+        choices=["streamvggt", "da3", "da3_chunked", "da3_pairwise", "depth_pnp", "da3_metric_pairwise", "openvins", "reloc3r"],
         default="streamvggt",
         help="Pose prediction model (default: streamvggt).\n"\
              "reloc3r uses first+last frames as anchors (batch). "
@@ -672,6 +672,24 @@ def main():
         preprocessed_hw = (504, 504)
 
         logger.info("Running Depth-PnP inference (%d frames)...", num_frames)
+        pred_w2c, pred_intrinsics = predictor.predict_poses(image_paths)
+
+    elif args.model == "da3_metric_pairwise":
+        from goggles.da3_metric_pairwise_predictor import DA3MetricPairwisePredictor
+
+        gt_intrinsics = {
+            "fl_x": transforms["fl_x"], "fl_y": transforms["fl_y"],
+            "cx": transforms["cx"], "cy": transforms["cy"],
+            "w": transforms["w"], "h": transforms["h"],
+        }
+        predictor = DA3MetricPairwisePredictor(
+            intrinsics=gt_intrinsics,
+            device=args.device,
+        )
+        device = predictor.device
+        preprocessed_hw = (504, 504)
+
+        logger.info("Running DA3Metric-PnP inference (%d frames)...", num_frames)
         pred_w2c, pred_intrinsics = predictor.predict_poses(image_paths)
 
     elif args.model == "openvins":
