@@ -77,11 +77,14 @@ cp ../GOGGLES/notes/openvins_setup/Dockerfile.rosfree .
 cp ../GOGGLES/notes/openvins_setup/docker-compose.yml .
 cp ../GOGGLES/notes/openvins_setup/run_from_files.cpp ov_msckf/src/
 cp -r ../GOGGLES/notes/openvins_setup/config_flightroom config/flightroom
+mkdir -p scripts
 cp ../GOGGLES/notes/openvins_setup/euroc_to_files.py scripts/
 cp ../GOGGLES/notes/openvins_setup/uzhfpv_to_files.py scripts/
 git apply ../GOGGLES/notes/openvins_setup/ROS1.cmake.patch
 docker compose build
 ```
+
+Review/edit paths inside `docker-compose.yml` as needed
 
 This builds `openvins:rosfree` — a minimal Ubuntu 22.04 image with the `run_from_files` binary (no ROS). See `notes/openvins_setup/README.md` for details on what we changed from upstream.
 

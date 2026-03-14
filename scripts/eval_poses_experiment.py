@@ -302,21 +302,35 @@ def main():
             config_yaml = str(config_dest / "estimator_config.yaml")
             logger.info("Copied OpenVINS config to %s", config_dest)
 
-            # The data dir is mounted at the same host path in both containers.
-            # Resolve symlinks so paths work in the OpenVINS container
-            # (which only has the data mount, not the GOGGLES workspace).
-            data_root = os.environ.get("DATA_PATH", "/media/admin/data/StanfordMSL")
+            # Docker-in-docker: volume source paths must be HOST paths.
+            # On Max's machine, /media/admin/data is mounted at the same path in
+            # both containers, so /workspace/GOGGLES paths resolve via symlinks.
+            if os.path.exists("/media/admin/data"):
+                # Max's machine: data mount covers /workspace/GOGGLES via symlinks
+                data_root = os.environ.get("DATA_PATH", "/media/admin/data/StanfordMSL")
+                def to_inner(p: Path) -> str:
+                    return str(p.resolve())
+            else:
+                # Rohit's machine: translate /workspace/GOGGLES → DATA_PATH/GOGGLES
+                data_root = os.path.expanduser(
+                    os.environ.get("DATA_PATH", "/home/rmak/Stanford-MSL/GOGGLES")
+                )
+                def to_inner(p: Path) -> str:
+                    s = str(p.resolve())
+                    if s.startswith("/workspace/GOGGLES"):
+                        s = data_root + "/GOGGLES" + s[len("/workspace/GOGGLES"):]
+                    return s
 
             run_stage("OPENVINS", [
                 "docker", "run", "--rm",
                 "-v", f"{data_root}:{data_root}",
                 "openvins:rosfree",
                 openvins_binary,
-                str(Path(config_yaml).resolve()),
-                str(imu_csv.resolve()),
-                str((exp_dir / "images").resolve()),
-                str(image_ts_csv.resolve()),
-                str(openvins_tum_path.resolve()),
+                to_inner(Path(config_yaml)),
+                to_inner(imu_csv),
+                to_inner(exp_dir / "images"),
+                to_inner(image_ts_csv),
+                to_inner(openvins_tum_path),
             ])
         else:
             logger.info("OpenVINS poses exist, skipping (use --force to re-run)")
