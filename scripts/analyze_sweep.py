@@ -25,7 +25,7 @@ import numpy as np
 import yaml
 
 
-DEFAULT_EXPERIMENTS_DIR = "/media/admin/data/StanfordMSL/GOGGLES/experiments"
+DEFAULT_EXPERIMENTS_DIR = "/workspace/GOGGLES/experiments"
 
 
 def experiment_dir_name(scene: str, course: str) -> str:
@@ -36,7 +36,7 @@ def experiment_dir_name(scene: str, course: str) -> str:
 def is_streaming_model(model: str, cfg: dict) -> bool:
     """Check if a model runs in streaming mode (processes all frames)."""
     return (
-        model in ("da3_pairwise", "openvins")
+        model in ("da3_pairwise", "openvins", "reloc3r")
         or (model == "streamvggt" and cfg.get("window_size") is not None)
     )
 
