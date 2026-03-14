@@ -24,10 +24,10 @@ services:
       # Mount Depth-Anything-3 for editable install
       - ${DA3_PATH:-../Depth-Anything-3}:/workspace/Depth-Anything-3
       # Mount data directory at same path as host so symlinks work
-      - ${DATA_PATH:-/media/admin/data/StanfordMSL}:${DATA_PATH:-/media/admin/data/StanfordMSL}
+      - ${DATA_PATH:-/home/rmak/Stanford-MSL/GOGGLES}:${DATA_PATH:-/home/rmak/Stanford-MSL/GOGGLES}
       # Persist model caches across container restarts
-      - ${MODEL_CACHE:-/media/admin/data/StanfordMSL/model_cache}:/home/goggles/.cache
-      - ${MODEL_CACHE:-/media/admin/data/StanfordMSL/model_cache}/torch_hub:/home/goggles/.torch_hub
+      - ${MODEL_CACHE:-/home/rmak/Stanford-MSL/GOGGLES/model_cache}:/home/goggles/.cache
+      - ${MODEL_CACHE:-/home/rmak/Stanford-MSL/GOGGLES/model_cache}/torch_hub:/home/goggles/.torch_hub
       # Docker socket for cross-container orchestration (OpenVINS)
       - /var/run/docker.sock:/var/run/docker.sock
       # Mount OpenVINS repo for config access + docker compose
@@ -36,6 +36,7 @@ services:
     environment:
       - DISPLAY=${DISPLAY:-}
       - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+      - TERM=xterm-256color
     deploy:
       resources:
         reservations:

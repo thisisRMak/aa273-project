@@ -27,3 +27,15 @@ RUN python -m pip install --no-cache-dir numpy==1.26.4
 # Docker CLI for cross-container orchestration (e.g., OpenVINS)
 # Only the CLI — no daemon. Socket is mounted at runtime.
 RUN apt-get update && apt-get install -y --no-install-recommends docker.io && rm -rf /var/lib/apt/lists/*
+
+
+# --- UI & Shell Enhancements ---
+# Set the terminal to support 256 colors
+ENV TERM=xterm-256color
+
+# Enable color output for common bash commands by adding aliases to the system-wide bashrc
+RUN echo "alias ls='ls -al --color=auto'" >> /etc/bash.bashrc && \
+    echo "alias grep='grep --color=auto'" >> /etc/bash.bashrc && \
+    echo "alias diff='diff --color=auto'" >> /etc/bash.bashrc
+
+RUN echo 'export PS1="\[\033[01;32m\]\u@docker\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ "' >> /etc/bash.bashrc
