@@ -24,18 +24,22 @@ RUN python -m pip install --no-cache-dir \
 # Re-pin numpy after all installs (downstream packages may pull in numpy 2.x)
 RUN python -m pip install --no-cache-dir numpy==1.26.4
 
-# Docker CLI for cross-container orchestration (e.g., OpenVINS)
-# Only the CLI — no daemon. Socket is mounted at runtime.
-RUN apt-get update && apt-get install -y --no-install-recommends docker.io && rm -rf /var/lib/apt/lists/*
-
+# Set timezone environment variables
+ENV TZ=America/Los_Angeles
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    docker.io \
+    tzdata && \
+    ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && \
+    echo $TZ > /etc/timezone && \
+    rm -rf /var/lib/apt/lists/*
 
 # --- UI & Shell Enhancements ---
-# Set the terminal to support 256 colors
 ENV TERM=xterm-256color
-
-# Enable color output for common bash commands by adding aliases to the system-wide bashrc
 RUN echo "alias ls='ls -al --color=auto'" >> /etc/bash.bashrc && \
     echo "alias grep='grep --color=auto'" >> /etc/bash.bashrc && \
-    echo "alias diff='diff --color=auto'" >> /etc/bash.bashrc
+    echo "alias diff='diff --color=auto'" >> /etc/bash.bashrc && \
+    echo 'export PS1="\[\033[01;32m\]\u@docker\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ "' >> /etc/bash.bashrc
 
-RUN echo 'export PS1="\[\033[01;32m\]\u@docker\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ "' >> /etc/bash.bashrc
+RUN echo 'trap "timer_start=\${timer_start:-\$(date +%s%3N)}" DEBUG' >> /etc/bash.bashrc && \
+    echo 'PROMPT_COMMAND='\''timer_stop=$(date +%s%3N); if [ -n "$timer_start" ]; then duration=$((timer_stop - timer_start)); echo -e "\e[33m(Took ${duration}ms)\e[0m"; unset timer_start; fi'\''' >> /etc/bash.bashrc
