@@ -2,7 +2,7 @@
 """Run a grid sweep of pose estimation experiments.
 
 Reads a YAML config defining the cross-product of
-  scenes × courses × models × num_frames
+  scenes × courses × rollouts × models × num_frames
 and calls eval_poses_experiment.py for each combination.
 
 Simulation (scene × course) is run once and reused across models/frames.
@@ -62,13 +62,17 @@ def load_sweep_config(path: str) -> dict:
         if not isinstance(val, list) or len(val) == 0:
             raise ValueError(f"'{key}' must be a non-empty list, got: {val}")
 
+    # Optional keys with defaults
+    if "rollouts" not in cfg:
+        cfg["rollouts"] = ["baseline"]
+
     return cfg
 
 
-def experiment_dir_name(scene: str, course: str) -> str:
+def experiment_dir_name(scene: str, course: str, rollout: str) -> str:
     """Deterministic directory name for a (scene, course) pair."""
     scene_short = scene.split("/")[0]
-    return f"{scene_short}_{course}"
+    return f"{scene_short}_{course}_{rollout}"
 
 
 def sweep_dir_name(config_path: str) -> str:
@@ -100,6 +104,7 @@ def metrics_filename(model: str, num_frames: int, cfg: dict) -> str:
 def run_single(
     scene: str,
     course: str,
+    rollout: str,
     model: str,
     num_frames: int,
     cfg: dict,
@@ -107,13 +112,13 @@ def run_single(
     dry_run: bool = False,
 ) -> dict | None:
     """Run one experiment combo. Returns metrics dict or None on failure."""
-    exp_name = experiment_dir_name(scene, course)
+    exp_name = experiment_dir_name(scene, course, rollout)
     exp_dir = Path(experiments_dir) / exp_name
     metrics_file = exp_dir / metrics_filename(model, num_frames, cfg)
 
     # Skip if results already exist
     if metrics_file.is_file():
-        logger.info("CACHED: %s / %s / %s / %df", scene, course, model, num_frames)
+        logger.info("CACHED: %s / %s / %s / %s / %df", scene, course, rollout, model, num_frames)
         with open(metrics_file) as f:
             return json.load(f)
 
@@ -121,6 +126,7 @@ def run_single(
         sys.executable, str(EXPERIMENT_SCRIPT),
         "--scene", scene,
         "--course", course,
+        "--rollout", rollout,
         "--model", model,
         "-n", str(num_frames),
         "--experiment-name", exp_name,
@@ -141,7 +147,7 @@ def run_single(
     if base == "openvins" or model.startswith("ekf_"):
         if cfg.get("imu_noise") is not None:
             cmd += ["--imu-noise", str(cfg["imu_noise"])]
-    for key in ("rollout", "frame", "policy"):
+    for key in ("frame", "policy"):
         if cfg.get(key) is not None:
             cmd += [f"--{key}", str(cfg[key])]
 
@@ -150,7 +156,7 @@ def run_single(
         return None
 
     logger.info("=" * 70)
-    logger.info("RUN: scene=%s  course=%s  model=%s  n=%d", scene, course, model, num_frames)
+    logger.info("RUN: scene=%s  course=%s  rollout=%s  model=%s  n=%d", scene, course, rollout, model, num_frames)
     logger.info("CMD: %s", " ".join(cmd))
     logger.info("=" * 70)
 
@@ -159,12 +165,12 @@ def run_single(
     elapsed = time.time() - t0
 
     if result.returncode != 0:
-        logger.error("FAILED (%.0fs): %s / %s / %s / %df",
-                      elapsed, scene, course, model, num_frames)
+        logger.error("FAILED (%.0fs): %s / %s / %s / %s / %df",
+                      elapsed, scene, course, rollout, model, num_frames)
         return None
 
-    logger.info("DONE (%.0fs): %s / %s / %s / %df",
-                 elapsed, scene, course, model, num_frames)
+    logger.info("DONE (%.0fs): %s / %s / %s / %s / %df",
+                 elapsed, scene, course, rollout, model, num_frames)
 
     if metrics_file.is_file():
         with open(metrics_file) as f:
@@ -175,10 +181,10 @@ def run_single(
 def collect_existing_results(cfg: dict, experiments_dir: str) -> list[dict]:
     """Scan experiment directories for existing metrics JSONs."""
     results = []
-    for scene, course, model, n in itertools.product(
-        cfg["scenes"], cfg["courses"], cfg["models"], cfg["num_frames"]
+    for scene, course, rollout, model, n in itertools.product(
+        cfg["scenes"], cfg["courses"], cfg["rollouts"], cfg["models"], cfg["num_frames"]
     ):
-        exp_name = experiment_dir_name(scene, course)
+        exp_name = experiment_dir_name(scene, course, rollout)
         exp_dir = Path(experiments_dir) / exp_name
         metrics_file = exp_dir / metrics_filename(model, n, cfg)
         if metrics_file.is_file():
@@ -187,6 +193,7 @@ def collect_existing_results(cfg: dict, experiments_dir: str) -> list[dict]:
             results.append({
                 "scene": scene,
                 "course": course,
+                "rollout": rollout,
                 "model": model,
                 "num_frames": n,
                 **{k: metrics.get(k) for k in METRIC_COLS},
@@ -200,7 +207,7 @@ def write_summary(results: list[dict], output_path: Path):
         logger.warning("No results to summarize.")
         return
 
-    fieldnames = ["scene", "course", "model", "num_frames"] + METRIC_COLS
+    fieldnames = ["scene", "course", "rollout", "model", "num_frames"] + METRIC_COLS
     with open(output_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -216,7 +223,7 @@ def print_summary_table(results: list[dict]):
         return
 
     # Header
-    hdr = f"{'scene':>30s}  {'course':>30s}  {'model':>14s}  {'n':>3s}"
+    hdr = f"{'scene':>30s}  {'course':>30s}  {'rollout':>14s}  {'model':>14s}  {'n':>3s}"
     for col in METRIC_COLS:
         short = col.replace("_error_median_deg", "_med").replace("auc_at_", "AUC@")
         hdr += f"  {short:>10s}"
@@ -225,7 +232,7 @@ def print_summary_table(results: list[dict]):
     print("-" * len(hdr))
 
     for row in sorted(results, key=lambda r: (r["scene"], r["course"], r["model"], r["num_frames"])):
-        line = f"{row['scene'].split('/')[0]:>30s}  {row['course']:>30s}  {row['model']:>14s}  {row['num_frames']:>3d}"
+        line = f"{row['scene'].split('/')[0]:>30s}  {row['course']:>30s}  {row['rollout']:>14s}  {row['model']:>14s}  {row['num_frames']:>3d}"
         for col in METRIC_COLS:
             val = row.get(col)
             line += f"  {val:>10.4f}" if val is not None else f"  {'—':>10s}"
@@ -248,10 +255,10 @@ def main():
     base_experiments_dir = args.experiments_dir or cfg.get("experiments_dir", DEFAULT_EXPERIMENTS_DIR)
 
     combos = list(itertools.product(
-        cfg["scenes"], cfg["courses"], cfg["models"], cfg["num_frames"]
+        cfg["scenes"], cfg["courses"], cfg["rollouts"], cfg["models"], cfg["num_frames"]
     ))
-    logger.info("Sweep: %d scenes × %d courses × %d models × %d frame counts = %d runs",
-                len(cfg["scenes"]), len(cfg["courses"]), len(cfg["models"]),
+    logger.info("Sweep: %d scenes × %d courses × %d rollouts × %d models × %d frame counts = %d runs",
+                len(cfg["scenes"]), len(cfg["courses"]), len(cfg["rollouts"]), len(cfg["models"]),
                 len(cfg["num_frames"]), len(combos))
 
     # Create a timestamped sweep directory so runs never overwrite each other
@@ -270,31 +277,32 @@ def main():
     # ---- Snapshot sweep config for reproducibility ----
     config_path = Path(args.config)
     shutil.copy2(config_path, Path(experiments_dir) / "sweep_config.yaml")
-    for scene, course in itertools.product(cfg["scenes"], cfg["courses"]):
-        exp_dir = Path(experiments_dir) / experiment_dir_name(scene, course)
+    for scene, course, rollout in itertools.product(cfg["scenes"], cfg["courses"], cfg["rollouts"]):
+        exp_dir = Path(experiments_dir) / experiment_dir_name(scene, course, rollout)
         exp_dir.mkdir(parents=True, exist_ok=True)
     logger.info("Created %d experiment directories under %s",
-                len(cfg["scenes"]) * len(cfg["courses"]), sweep_name)
+                len(cfg["scenes"]) * len(cfg["courses"]) * len(cfg["rollouts"]), sweep_name)
 
     # ---- Run the sweep ----
     results = []
     n_done, n_fail, n_cached = 0, 0, 0
 
-    # Order: iterate scenes × courses first (simulation reuse), then models × frames
-    for scene, course in itertools.product(cfg["scenes"], cfg["courses"]):
+    # Order: iterate scenes × courses × rollouts first (simulation reuse), then models × frames
+    for scene, course, rollout in itertools.product(cfg["scenes"], cfg["courses"], cfg["rollouts"] ):
         for model, num_frames in itertools.product(cfg["models"], cfg["num_frames"]):
-            exp_name = experiment_dir_name(scene, course)
+            exp_name = experiment_dir_name(scene, course, rollout)
             exp_dir = Path(experiments_dir) / exp_name
             metrics_file = exp_dir / metrics_filename(model, num_frames, cfg)
 
             was_cached = metrics_file.is_file()
-            metrics = run_single(scene, course, model, num_frames, cfg,
+            metrics = run_single(scene, course, rollout, model, num_frames, cfg,
                                  experiments_dir, dry_run=args.dry_run)
 
             if metrics is not None:
                 results.append({
                     "scene": scene,
                     "course": course,
+                    "rollout": rollout,
                     "model": model,
                     "num_frames": num_frames,
                     **{k: metrics.get(k) for k in METRIC_COLS},
