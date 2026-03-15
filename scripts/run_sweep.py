@@ -249,6 +249,8 @@ def main():
                         help="Collect existing results and print summary (no new runs).")
     parser.add_argument("--experiments-dir", default=None,
                         help=f"Override experiments directory (default from config or {DEFAULT_EXPERIMENTS_DIR}).")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume the latest sweep matching this config (skip creating a new sweep directory).")
     args = parser.parse_args()
 
     cfg = load_sweep_config(args.config)
@@ -261,18 +263,26 @@ def main():
                 len(cfg["scenes"]), len(cfg["courses"]), len(cfg["rollouts"]), len(cfg["models"]),
                 len(cfg["num_frames"]), len(combos))
 
-    # Create a timestamped sweep directory so runs never overwrite each other
+    
     sweep_name = sweep_dir_name(args.config)
-    experiments_dir = str(Path(base_experiments_dir) / sweep_name)
-    Path(experiments_dir).mkdir(parents=True, exist_ok=True)
-    logger.info("Sweep directory: %s", experiments_dir)
+    if not args.resume:
+        # Create new timestamped directory
+        experiments_dir = str(Path(base_experiments_dir) / sweep_name)
+        Path(experiments_dir).mkdir(parents=True, exist_ok=True)
+    else:
+        # Find latest matching sweep directory
+        stem = Path(args.config).stem
+        candidates = sorted(Path(base_experiments_dir).glob(f"{stem}_*"), reverse=True)
+        candidates = [d for d in candidates if d.is_dir() and (d / "sweep_config.yaml").is_file()]
+        if candidates:
+            experiments_dir = str(candidates[0])
+            logger.info("Resuming sweep: %s", experiments_dir)
+        else:
+            logger.warning("No existing sweep found for '%s', creating new one", stem)
+            experiments_dir = str(Path(base_experiments_dir) / sweep_name)
+            Path(experiments_dir).mkdir(parents=True, exist_ok=True)
 
-    if args.summary_only:
-        results = collect_existing_results(cfg, experiments_dir)
-        print_summary_table(results)
-        summary_path = Path(experiments_dir) / "sweep_summary.csv"
-        write_summary(results, summary_path)
-        return
+    
 
     # ---- Snapshot sweep config for reproducibility ----
     config_path = Path(args.config)
