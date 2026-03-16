@@ -89,7 +89,7 @@ def is_streaming_model(model: str, cfg: dict) -> bool:
     """Check if a model runs in streaming mode (processes all frames)."""
     base = model[4:] if model.startswith("ekf_") else model
     return (
-        base in ("da3_pairwise", "openvins", "reloc3r")
+        base in ("da3_pairwise", "openvins", "reloc3r", "depth_pnp", "da3_metric_pairwise")
         or (base == "streamvggt" and cfg.get("window_size") is not None)
     )
 
