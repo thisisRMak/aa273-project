@@ -46,7 +46,7 @@ GOGGLES extends the `figs:latest` Docker image. Build it first:
 cd /path/to/StanfordMSL
 git clone https://github.com/madang6/FiGS-Standalone.git
 cd FiGS-Standalone
-docker compose build
+CUDA_ARCHITECTURES=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '.') docker compose build
 ```
 
 ### 4. Clone reloc3r
