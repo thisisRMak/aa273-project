@@ -66,6 +66,12 @@ def load_sweep_config(path: str) -> dict:
     if "rollouts" not in cfg:
         cfg["rollouts"] = ["baseline"]
 
+    # Normalize imu_noise to a list
+    if "imu_noise" not in cfg:
+        cfg["imu_noise"] = ["none"]
+    elif isinstance(cfg["imu_noise"], str):
+        cfg["imu_noise"] = [cfg["imu_noise"]]
+
     return cfg
 
 
@@ -85,6 +91,11 @@ def sweep_dir_name(config_path: str) -> str:
     return f"{stem}_{timestamp}"
 
 
+def is_imu_model(model: str) -> bool:
+    """Check if a model uses IMU data (affected by imu_noise)."""
+    return model == "openvins" or model.startswith("ekf_")
+
+
 def is_streaming_model(model: str, cfg: dict) -> bool:
     """Check if a model runs in streaming mode (processes all frames)."""
     base = model[4:] if model.startswith("ekf_") else model
@@ -94,11 +105,12 @@ def is_streaming_model(model: str, cfg: dict) -> bool:
     )
 
 
-def metrics_filename(model: str, num_frames: int, cfg: dict) -> str:
+def metrics_filename(model: str, num_frames: int, cfg: dict, imu_noise: str | None = None) -> str:
     """Return the metrics JSON filename for a model configuration."""
+    noise_suffix = f"_{imu_noise}" if (imu_noise is not None and is_imu_model(model)) else ""
     if is_streaming_model(model, cfg):
-        return f"metrics_{model}_all.json"
-    return f"metrics_{model}_{num_frames}f.json"
+        return f"metrics_{model}{noise_suffix}_all.json"
+    return f"metrics_{model}{noise_suffix}_{num_frames}f.json"
 
 
 def run_single(
@@ -109,16 +121,17 @@ def run_single(
     num_frames: int,
     cfg: dict,
     experiments_dir: str,
+    imu_noise: str = "none",
     dry_run: bool = False,
 ) -> dict | None:
     """Run one experiment combo. Returns metrics dict or None on failure."""
     exp_name = experiment_dir_name(scene, course, rollout)
     exp_dir = Path(experiments_dir) / exp_name
-    metrics_file = exp_dir / metrics_filename(model, num_frames, cfg)
+    metrics_file = exp_dir / metrics_filename(model, num_frames, cfg, imu_noise)
 
     # Skip if results already exist
     if metrics_file.is_file():
-        logger.info("CACHED: %s / %s / %s / %s / %df", scene, course, rollout, model, num_frames)
+        logger.info("CACHED: %s / %s / %s / %s / %s / %df", scene, course, rollout, model, imu_noise, num_frames)
         with open(metrics_file) as f:
             return json.load(f)
 
@@ -144,9 +157,8 @@ def run_single(
     if base == "openvins":
         if cfg.get("openvins_config") is not None:
             cmd += ["--openvins-config", str(cfg["openvins_config"])]
-    if base == "openvins" or model.startswith("ekf_"):
-        if cfg.get("imu_noise") is not None:
-            cmd += ["--imu-noise", str(cfg["imu_noise"])]
+    if is_imu_model(model):
+        cmd += ["--imu-noise", imu_noise]
     for key in ("frame", "policy"):
         if cfg.get(key) is not None:
             cmd += [f"--{key}", str(cfg[key])]
@@ -156,7 +168,7 @@ def run_single(
         return None
 
     logger.info("=" * 70)
-    logger.info("RUN: scene=%s  course=%s  rollout=%s  model=%s  n=%d", scene, course, rollout, model, num_frames)
+    logger.info("RUN: scene=%s  course=%s  rollout=%s  model=%s  noise=%s  n=%d", scene, course, rollout, model, imu_noise, num_frames)
     logger.info("CMD: %s", " ".join(cmd))
     logger.info("=" * 70)
 
@@ -165,12 +177,12 @@ def run_single(
     elapsed = time.time() - t0
 
     if result.returncode != 0:
-        logger.error("FAILED (%.0fs): %s / %s / %s / %s / %df",
-                      elapsed, scene, course, rollout, model, num_frames)
+        logger.error("FAILED (%.0fs): %s / %s / %s / %s / %s / %df",
+                      elapsed, scene, course, rollout, model, imu_noise, num_frames)
         return None
 
-    logger.info("DONE (%.0fs): %s / %s / %s / %s / %df",
-                 elapsed, scene, course, rollout, model, num_frames)
+    logger.info("DONE (%.0fs): %s / %s / %s / %s / %s / %df",
+                 elapsed, scene, course, rollout, model, imu_noise, num_frames)
 
     if metrics_file.is_file():
         with open(metrics_file) as f:
@@ -181,12 +193,14 @@ def run_single(
 def collect_existing_results(cfg: dict, experiments_dir: str) -> list[dict]:
     """Scan experiment directories for existing metrics JSONs."""
     results = []
-    for scene, course, rollout, model, n in itertools.product(
-        cfg["scenes"], cfg["courses"], cfg["rollouts"], cfg["models"], cfg["num_frames"]
+    for scene, course, rollout, model, n, imu_noise in itertools.product(
+        cfg["scenes"], cfg["courses"], cfg["rollouts"], cfg["models"], cfg["num_frames"], cfg["imu_noise"]
     ):
+        if not is_imu_model(model) and imu_noise != cfg["imu_noise"][0]:
+            continue
         exp_name = experiment_dir_name(scene, course, rollout)
         exp_dir = Path(experiments_dir) / exp_name
-        metrics_file = exp_dir / metrics_filename(model, n, cfg)
+        metrics_file = exp_dir / metrics_filename(model, n, cfg, imu_noise)
         if metrics_file.is_file():
             with open(metrics_file) as f:
                 metrics = json.load(f)
@@ -195,6 +209,7 @@ def collect_existing_results(cfg: dict, experiments_dir: str) -> list[dict]:
                 "course": course,
                 "rollout": rollout,
                 "model": model,
+                "imu_noise": imu_noise,
                 "num_frames": n,
                 **{k: metrics.get(k) for k in METRIC_COLS},
             })
@@ -207,7 +222,7 @@ def write_summary(results: list[dict], output_path: Path):
         logger.warning("No results to summarize.")
         return
 
-    fieldnames = ["scene", "course", "rollout", "model", "num_frames"] + METRIC_COLS
+    fieldnames = ["scene", "course", "rollout", "model", "imu_noise", "num_frames"] + METRIC_COLS
     with open(output_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -223,7 +238,7 @@ def print_summary_table(results: list[dict]):
         return
 
     # Header
-    hdr = f"{'scene':>30s}  {'course':>30s}  {'rollout':>14s}  {'model':>14s}  {'n':>3s}"
+    hdr = f"{'scene':>30s}  {'course':>30s}  {'rollout':>14s}  {'model':>14s}  {'noise':>6s}  {'n':>3s}"
     for col in METRIC_COLS:
         short = col.replace("_error_median_deg", "_med").replace("auc_at_", "AUC@")
         hdr += f"  {short:>10s}"
@@ -231,8 +246,8 @@ def print_summary_table(results: list[dict]):
     print(hdr)
     print("-" * len(hdr))
 
-    for row in sorted(results, key=lambda r: (r["scene"], r["course"], r["model"], r["num_frames"])):
-        line = f"{row['scene'].split('/')[0]:>30s}  {row['course']:>30s}  {row['rollout']:>14s}  {row['model']:>14s}  {row['num_frames']:>3d}"
+    for row in sorted(results, key=lambda r: (r["scene"], r["course"], r["model"], r["imu_noise"], r["num_frames"])):
+        line = f"{row['scene'].split('/')[0]:>30s}  {row['course']:>30s}  {row['rollout']:>14s}  {row['model']:>14s}  {row['imu_noise']:>6s}  {row['num_frames']:>3d}"
         for col in METRIC_COLS:
             val = row.get(col)
             line += f"  {val:>10.4f}" if val is not None else f"  {'—':>10s}"
@@ -257,11 +272,11 @@ def main():
     base_experiments_dir = args.experiments_dir or cfg.get("experiments_dir", DEFAULT_EXPERIMENTS_DIR)
 
     combos = list(itertools.product(
-        cfg["scenes"], cfg["courses"], cfg["rollouts"], cfg["models"], cfg["num_frames"]
+        cfg["scenes"], cfg["courses"], cfg["rollouts"], cfg["models"], cfg["num_frames"], cfg["imu_noise"]
     ))
-    logger.info("Sweep: %d scenes × %d courses × %d rollouts × %d models × %d frame counts = %d runs",
+    logger.info("Sweep: %d scenes × %d courses × %d rollouts × %d models × %d frame counts × %d noise levels = up to %d runs",
                 len(cfg["scenes"]), len(cfg["courses"]), len(cfg["rollouts"]), len(cfg["models"]),
-                len(cfg["num_frames"]), len(combos))
+                len(cfg["num_frames"]), len(cfg["imu_noise"]), len(combos))
 
     
     sweep_name = sweep_dir_name(args.config)
@@ -297,16 +312,19 @@ def main():
     results = []
     n_done, n_fail, n_cached = 0, 0, 0
 
-    # Order: iterate scenes × courses × rollouts first (simulation reuse), then models × frames
-    for scene, course, rollout in itertools.product(cfg["scenes"], cfg["courses"], cfg["rollouts"] ):
-        for model, num_frames in itertools.product(cfg["models"], cfg["num_frames"]):
+    # Order: iterate scenes × courses × rollouts first (simulation reuse), then models × frames × noise
+    for scene, course, rollout in itertools.product(cfg["scenes"], cfg["courses"], cfg["rollouts"]):
+        for model, num_frames, imu_noise in itertools.product(cfg["models"], cfg["num_frames"], cfg["imu_noise"]):
+            # Non-IMU models are unaffected by noise; only run once (first noise level)
+            if not is_imu_model(model) and imu_noise != cfg["imu_noise"][0]:
+                continue
             exp_name = experiment_dir_name(scene, course, rollout)
             exp_dir = Path(experiments_dir) / exp_name
-            metrics_file = exp_dir / metrics_filename(model, num_frames, cfg)
+            metrics_file = exp_dir / metrics_filename(model, num_frames, cfg, imu_noise)
 
             was_cached = metrics_file.is_file()
             metrics = run_single(scene, course, rollout, model, num_frames, cfg,
-                                 experiments_dir, dry_run=args.dry_run)
+                                 experiments_dir, imu_noise=imu_noise, dry_run=args.dry_run)
 
             if metrics is not None:
                 results.append({
@@ -314,6 +332,7 @@ def main():
                     "course": course,
                     "rollout": rollout,
                     "model": model,
+                    "imu_noise": imu_noise,
                     "num_frames": num_frames,
                     **{k: metrics.get(k) for k in METRIC_COLS},
                 })

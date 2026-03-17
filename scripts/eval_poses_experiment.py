@@ -247,10 +247,10 @@ def main():
         # IMU data goes in openvins/ for openvins, imu/ for ekf models
         imu_dir = exp_dir / ("openvins" if base_model == "openvins" else "imu")
         imu_dir.mkdir(exist_ok=True)
-        imu_csv = imu_dir / "imu.csv"
+        imu_csv = imu_dir / f"imu_{args.imu_noise}.csv"
         image_ts_csv = imu_dir / "image_timestamps.csv"
         if base_model == "openvins":
-            openvins_tum_path = imu_dir / "poses_tum.txt"
+            openvins_tum_path = imu_dir / f"poses_tum_{args.imu_noise}.txt"
 
         # 1. Synthesize IMU from tXUd (runs in this container, Python only)
         if not imu_csv.is_file() or args.force:
@@ -357,10 +357,11 @@ def main():
         base_model in ("da3_pairwise", "depth_pnp", "da3_metric_pairwise", "openvins", "reloc3r")
         or (base_model == "streamvggt" and args.window_size is not None)
     )
+    noise_tag = f"_{args.imu_noise}" if (use_ekf or base_model == "openvins") else ""
     if is_streaming:
-        metrics_stem = f"metrics_{full_model_name}_all"
+        metrics_stem = f"metrics_{full_model_name}{noise_tag}_all"
     else:
-        metrics_stem = f"metrics_{full_model_name}_{args.num_frames}f"
+        metrics_stem = f"metrics_{full_model_name}{noise_tag}_{args.num_frames}f"
 
     if skip_idx <= 1:
         eval_cmd = [
@@ -415,10 +416,10 @@ def main():
                     f"{metrics_stem}.json", f"{metrics_stem}.png",
                     f"{metrics_stem}_trajectory.png"]
     if base_model == "openvins":
-        output_files += ["openvins/imu.csv", "openvins/image_timestamps.csv",
-                          "openvins/poses_tum.txt"]
+        output_files += [f"openvins/imu_{args.imu_noise}.csv", "openvins/image_timestamps.csv",
+                          f"openvins/poses_tum_{args.imu_noise}.txt"]
     elif use_ekf:
-        output_files += ["imu/imu.csv", "imu/image_timestamps.csv"]
+        output_files += [f"imu/imu_{args.imu_noise}.csv", "imu/image_timestamps.csv"]
     for name in output_files:
         path = exp_dir / name
         status = "OK" if path.exists() else "missing"

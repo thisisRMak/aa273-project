@@ -28,41 +28,60 @@ import yaml
 DEFAULT_EXPERIMENTS_DIR = "/workspace/GOGGLES/experiments"
 
 
-def experiment_dir_name(scene: str, course: str) -> str:
+def experiment_dir_name(scene: str, course: str, rollout: str = "baseline") -> str:
     scene_short = scene.split("/")[0]
-    return f"{scene_short}_{course}"
+    return f"{scene_short}_{course}_{rollout}"
+
+
+def is_imu_model(model: str) -> bool:
+    """Check if a model uses IMU data (affected by imu_noise)."""
+    return model == "openvins" or model.startswith("ekf_")
 
 
 def is_streaming_model(model: str, cfg: dict) -> bool:
     """Check if a model runs in streaming mode (processes all frames)."""
+    base = model[4:] if model.startswith("ekf_") else model
     return (
-        model in ("da3_pairwise", "openvins", "reloc3r")
-        or (model == "streamvggt" and cfg.get("window_size") is not None)
+        base in ("da3_pairwise", "openvins", "reloc3r", "depth_pnp", "da3_metric_pairwise")
+        or (base == "streamvggt" and cfg.get("window_size") is not None)
     )
 
 
-def metrics_filename(model: str, num_frames: int, cfg: dict) -> str:
+def metrics_filename(model: str, num_frames: int, cfg: dict, imu_noise: str | None = None) -> str:
     """Return the metrics JSON filename for a model configuration."""
+    noise_suffix = f"_{imu_noise}" if (imu_noise is not None and is_imu_model(model)) else ""
     if is_streaming_model(model, cfg):
-        return f"metrics_{model}_all.json"
-    return f"metrics_{model}_{num_frames}f.json"
+        return f"metrics_{model}{noise_suffix}_all.json"
+    return f"metrics_{model}{noise_suffix}_{num_frames}f.json"
 
 
 def load_all_metrics(cfg: dict, experiments_dir: str) -> list[dict]:
     """Collect all metrics JSONs matching the sweep config."""
+    imu_noise_levels = cfg.get("imu_noise", ["none"])
+    if isinstance(imu_noise_levels, str):
+        imu_noise_levels = [imu_noise_levels]
+    rollouts = cfg.get("rollouts", ["baseline"])
+
     results = []
-    for scene, course, model, n in itertools.product(
-        cfg["scenes"], cfg["courses"], cfg["models"], cfg["num_frames"]
+    for scene, course, rollout, model, n, imu_noise in itertools.product(
+        cfg["scenes"], cfg["courses"], rollouts, cfg["models"], cfg["num_frames"], imu_noise_levels
     ):
-        exp_name = experiment_dir_name(scene, course)
-        metrics_file = Path(experiments_dir) / exp_name / metrics_filename(model, n, cfg)
+        if not is_imu_model(model) and imu_noise != imu_noise_levels[0]:
+            continue
+        # When sweeping multiple noise levels, embed noise in model label for IMU models
+        effective_model = (
+            f"{model}_{imu_noise}" if (is_imu_model(model) and len(imu_noise_levels) > 1) else model
+        )
+        exp_name = experiment_dir_name(scene, course, rollout)
+        metrics_file = Path(experiments_dir) / exp_name / metrics_filename(model, n, cfg, imu_noise)
         if metrics_file.is_file():
             with open(metrics_file) as f:
                 m = json.load(f)
             results.append({
                 "scene": scene.split("/")[0],
                 "course": course,
-                "model": model,
+                "rollout": rollout,
+                "model": effective_model,
                 "num_frames": n,
                 "rot_med": m.get("rotation_error_median_deg"),
                 "rot_mean": m.get("rotation_error_mean_deg"),
@@ -454,7 +473,7 @@ def _flat_table_markdown(results: list[dict], sort_keys: list[tuple], label: str
     lines.append(f"### {label}")
     lines.append("")
 
-    headers = ["Scene", "Course", "Model", "N", "Rot Med (°)", "Trans Med (°)",
+    headers = ["Scene", "Course", "Rollout", "Model", "N", "Rot Med (°)", "Trans Med (°)",
                "AUC@5", "AUC@15"]
 
     def sort_val(r, field, ascending):
@@ -464,7 +483,7 @@ def _flat_table_markdown(results: list[dict], sort_keys: list[tuple], label: str
         return v if ascending else -v
 
     sorted_results = sorted(results, key=lambda r: tuple(
-        sort_val(r, field, asc) if field not in ("scene", "course", "model")
+        sort_val(r, field, asc) if field not in ("scene", "course", "rollout", "model")
         else r.get(field, "")
         for field, asc in sort_keys
     ))
@@ -472,7 +491,7 @@ def _flat_table_markdown(results: list[dict], sort_keys: list[tuple], label: str
     all_rows = []
     for r in sorted_results:
         cells = [
-            r["scene"], r["course"], r["model"], str(r["num_frames"]),
+            r["scene"], r["course"], r.get("rollout", "baseline"), r["model"], str(r["num_frames"]),
             fmt(r.get("rot_med")), fmt(r.get("trans_med")),
             fmt(r.get("auc5")), fmt(r.get("auc15")),
         ]
@@ -485,12 +504,12 @@ def _flat_table_markdown(results: list[dict], sort_keys: list[tuple], label: str
             widths[i] = max(widths[i], len(cell))
 
     def pad(cell, i):
-        return cell.rjust(widths[i]) if i >= 3 else cell.ljust(widths[i])
+        return cell.rjust(widths[i]) if i >= 4 else cell.ljust(widths[i])
 
     lines.append("| " + " | ".join(pad(h, i) for i, h in enumerate(headers)) + " |")
     seps = []
     for i, w in enumerate(widths):
-        seps.append("-" * (w - 1) + ":" if i >= 3 else "-" * w)
+        seps.append("-" * (w - 1) + ":" if i >= 4 else "-" * w)
     lines.append("| " + " | ".join(seps) + " |")
 
     for row in all_rows:
@@ -577,8 +596,9 @@ def generate_trajectory_comparisons(cfg: dict, experiments_dir: str, out_dir: Pa
         plot_multi_method_trajectories,
     )
 
-    for scene, course in itertools.product(cfg["scenes"], cfg["courses"]):
-        exp_name = experiment_dir_name(scene, course)
+    rollouts = cfg.get("rollouts", ["baseline"])
+    for scene, course, rollout in itertools.product(cfg["scenes"], cfg["courses"], rollouts):
+        exp_name = experiment_dir_name(scene, course, rollout)
         exp_dir = Path(experiments_dir) / exp_name
 
         # Discover all trajectory .npz files
