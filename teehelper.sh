@@ -6,24 +6,40 @@ if [ $# -eq 0 ]; then
     exit 1
 fi
 
-# Create a sortable timestamp (YYYYMMDD_HHMMSS)
+# Create timestamps
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+START_TIME_READABLE=$(date +"%Y-%m-%d %H:%M:%S")
+START_SECONDS=$(date +%s)
 LOGFILE="log_${TIMESTAMP}.txt"
 
-# Capture the full command line call
-# "$*" joins all arguments into a single string
 FULL_COMMAND="$*"
 
-# 1. Write the command being run to the log first
-echo "Command executed: $FULL_COMMAND" >> "$LOGFILE"
-echo "------------------------------------------" >> "$LOGFILE"
+# 1. Write metadata to log and stdout
+{
+    echo "Command executed: $FULL_COMMAND"
+    echo "Started at:       $START_TIME_READABLE"
+    echo "------------------------------------------"
+} >> "$LOGFILE"
+echo "Saving Log file at:"
+echo $LOGFILE
 
 # 2. Execute the command
-# "$@" preserves individual arguments even if they contain spaces
-# 2>&1 merges stderr into stdout
-# tee -a appends to the log while showing output in terminal
+
 "$@" 2>&1 | tee -a "$LOGFILE"
 
-echo "------------------------------------------" 
-echo "Output saved to: $LOGFILE"
+# 3. Calculate Elapsed Time
+END_SECONDS=$(date +%s)
+END_TIME_READABLE=$(date +"%Y-%m-%d %H:%M:%S")
+ELAPSED=$(( END_SECONDS - START_SECONDS ))
 
+# 4. Final Readout
+{
+    echo "------------------------------------------"
+    echo "Finished at:      $END_TIME_READABLE"
+    echo "Total duration:   $ELAPSED seconds"
+} >> "$LOGFILE"
+
+echo "------------------------------------------" 
+echo "Finished in $ELAPSED seconds."
+echo "Output saved to:" 
+echo $LOGFILE
